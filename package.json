@@ -1,0 +1,30 @@
+{
+  "name": "rolecast",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Rolecast 本地优先的多 Agent 协作工作区",
+  "packageManager": "pnpm@10.20.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "pnpm -r typecheck",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "test:fake": "pnpm --filter @rolecast/acp-contract test -- --run",
+    "test:acp": "RUN_ACP_INTEGRATION=1 pnpm --filter @rolecast/acp-contract test -- --run"
+  },
+  "devDependencies": {
+    "@types/node": "22.15.21",
+    "typescript": "5.8.3",
+    "vitest": "3.1.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "@anthropic-ai/claude-agent-sdk",
+      "@openai/codex",
+      "better-sqlite3",
+      "esbuild"
+    ]
+  }
+}

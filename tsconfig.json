@@ -1,0 +1,9 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/contract" },
+    { "path": "./packages/server" },
+    { "path": "./tests/contract" },
+    { "path": "./apps/web" }
+  ]
+}

@@ -1,0 +1,359 @@
+{
+  "version": "1.0.0",
+  "meta": {
+    "description": "可机检规则的唯一定义点。pre-edit-guard.sh 运行时读取；generate-guard-config.sh 只用来写 hook 接线，不生成本文件的 rules。",
+    "generated_by": "hand-maintained"
+  },
+  "rules": [
+    {
+      "id": "file-max-lines",
+      "name": "文件不超过800行",
+      "description": "单个文件不超过800行，超过须拆分。200–400行典型，800行最大。",
+      "severity": "warn",
+      "category": "code-size",
+      "source": ".agents/coding-standards/common.md",
+      "check": {
+        "type": "file-max-lines",
+        "params": {
+          "max_lines": 800
+        }
+      },
+      "file_patterns": [
+        "*.ts",
+        "*.tsx",
+        "*.vue",
+        "*.js",
+        "*.jsx",
+        "*.py",
+        "*.go",
+        "*.rs",
+        "*.swift",
+        "*.css",
+        "*.scss",
+        "*.sh",
+        "*.md"
+      ],
+      "exclude_patterns": [
+        "*.d.ts",
+        "*.test.*",
+        "*.spec.*",
+        "*.min.*",
+        "*.generated.*",
+        "*.lock",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock"
+      ],
+      "message": "文件 {path} 有 {actual} 行，超过最大限制 {max_lines} 行",
+      "suggestion": "请将大文件拆分为多个职责单一的小文件，每个文件200-400行为宜。"
+    },
+    {
+      "id": "no-any-type",
+      "name": "禁止使用 any 类型",
+      "description": "禁止使用 TypeScript any 类型，第三方库无法避免除外。",
+      "severity": "warn",
+      "category": "type-safety",
+      "source": ".agents/coding-standards/typescript.md",
+      "check": {
+        "type": "content-regex-forbidden",
+        "params": {
+          "regex": ":\\s*any\\b|\\bas any\\b|<any>|<any\\[|<Array<any>|Record<.*,\\s*any>"
+        }
+      },
+      "file_patterns": [
+        "*.ts",
+        "*.tsx"
+      ],
+      "exclude_patterns": [
+        "*.d.ts"
+      ],
+      "message": "文件中包含 any 类型，违反类型安全约束",
+      "suggestion": "请使用具体类型、泛型或 unknown 替代 any。"
+    },
+    {
+      "id": "no-console-log",
+      "name": "禁止 console.log",
+      "description": "禁止在业务代码中保留 console.log / console.debug / console.info。",
+      "severity": "warn",
+      "category": "code-quality",
+      "source": ".agents/coding-standards/typescript.md",
+      "check": {
+        "type": "content-regex-forbidden",
+        "params": {
+          "regex": "console\\.(log|debug|info)\\s*\\("
+        }
+      },
+      "file_patterns": [
+        "*.ts",
+        "*.tsx",
+        "*.js",
+        "*.jsx",
+        "*.vue"
+      ],
+      "exclude_patterns": [
+        "*.test.*",
+        "*.spec.*",
+        "*.config.*"
+      ],
+      "message": "文件中残留 console.{match} 调试语句",
+      "suggestion": "请移除调试用的 console 语句。如需日志，使用项目统一的日志工具。"
+    },
+    {
+      "id": "no-dangerously-set-inner-html",
+      "name": "禁止 dangerouslySetInnerHTML（React XSS 防护）",
+      "description": "禁止在 React 中使用 dangerouslySetInnerHTML，防止 XSS 攻击。",
+      "severity": "error",
+      "category": "security",
+      "source": ".agents/quality-checklist.md",
+      "check": {
+        "type": "content-regex-forbidden",
+        "params": {
+          "regex": "dangerouslySetInnerHTML"
+        }
+      },
+      "file_patterns": [
+        "*.tsx",
+        "*.jsx"
+      ],
+      "exclude_patterns": [],
+      "message": "React 组件中使用了 dangerouslySetInnerHTML，存在 XSS 风险",
+      "suggestion": "请使用 React 的文本插值或经过 DOMPurify 净化的内容。"
+    },
+    {
+      "id": "no-double-equals",
+      "name": "禁止使用 ==",
+      "description": "禁止使用 == 进行相等比较，必须使用 ===。",
+      "severity": "warn",
+      "category": "style",
+      "source": ".agents/coding-standards/typescript.md",
+      "check": {
+        "type": "content-regex-forbidden",
+        "params": {
+          "regex": "[^=!><]==[^=]"
+        }
+      },
+      "file_patterns": [
+        "*.ts",
+        "*.tsx",
+        "*.js",
+        "*.jsx",
+        "*.vue"
+      ],
+      "exclude_patterns": [],
+      "message": "文件中使用了 == 而非 ===",
+      "suggestion": "请使用 === 替代 ==，避免隐式类型转换。"
+    },
+    {
+      "id": "no-hardcoded-secrets",
+      "name": "禁止硬编码敏感信息",
+      "description": "禁止在代码中硬编码 API 密钥、密码、令牌等敏感信息。",
+      "severity": "error",
+      "category": "security",
+      "source": ".agents/coding-standards/common.md",
+      "check": {
+        "type": "content-regex-forbidden",
+        "params": {
+          "regex": "(api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?key|auth[_-]?token|private[_-]?key|password|passwd)\\s*[=:]\\s*['\"][^'\"`]{8,}['\"]|sk-[a-zA-Z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[a-zA-Z0-9]{36}|-----BEGIN\\s*(RSA|EC|DSA|OPENSSH)\\s*PRIVATE KEY-----"
+        }
+      },
+      "file_patterns": [
+        "*"
+      ],
+      "exclude_patterns": [
+        "*.lock",
+        "*.test.*",
+        "*.spec.*",
+        "constraints.json"
+      ],
+      "message": "文件中检测到疑似硬编码的敏感信息",
+      "suggestion": "请使用环境变量或密钥管理服务存储敏感信息，不要在代码中硬编码。"
+    },
+    {
+      "id": "no-innerHTML",
+      "name": "禁止 innerHTML（XSS 防护）",
+      "description": "禁止直接使用 innerHTML 设置 HTML 内容，防止 XSS 攻击。",
+      "severity": "error",
+      "category": "security",
+      "source": ".agents/quality-checklist.md",
+      "check": {
+        "type": "content-regex-forbidden",
+        "params": {
+          "regex": "\\.innerHTML\\s*="
+        }
+      },
+      "file_patterns": [
+        "*.ts",
+        "*.tsx",
+        "*.js",
+        "*.jsx",
+        "*.vue"
+      ],
+      "exclude_patterns": [],
+      "message": "文件中使用了 .innerHTML =，存在 XSS 风险",
+      "suggestion": "请使用 textContent 或经过净化的 HTML 设置方法。"
+    },
+    {
+      "id": "no-v-html",
+      "name": "禁止 v-html（Vue XSS 防护）",
+      "description": "禁止使用 Vue 的 v-html 指令直接渲染未处理的 HTML，防止 XSS 攻击。",
+      "severity": "error",
+      "category": "security",
+      "source": ".agents/quality-checklist.md",
+      "check": {
+        "type": "content-regex-forbidden",
+        "params": {
+          "regex": "v-html\\s*="
+        }
+      },
+      "file_patterns": [
+        "*.vue"
+      ],
+      "exclude_patterns": [],
+      "message": "Vue 文件中使用了 v-html，存在 XSS 风险",
+      "suggestion": "请使用文本插值 {{ }} 或经过 DOMPurify 净化后再渲染。"
+    },
+    {
+      "id": "no-var",
+      "name": "禁止使用 var",
+      "description": "禁止使用 var 声明变量，必须使用 const 或 let。",
+      "severity": "warn",
+      "category": "style",
+      "source": ".agents/coding-standards/typescript.md",
+      "check": {
+        "type": "content-regex-forbidden",
+        "params": {
+          "regex": "\\bvar\\s+[a-zA-Z_$]"
+        }
+      },
+      "file_patterns": [
+        "*.ts",
+        "*.tsx",
+        "*.js",
+        "*.jsx",
+        "*.vue"
+      ],
+      "exclude_patterns": [],
+      "message": "文件中使用了 var 声明变量",
+      "suggestion": "请使用 const（优先）或 let 替代 var。"
+    },
+    {
+      "id": "no-hardcoded-mock",
+      "name": "禁止 mock 数据兜底",
+      "description": "禁止在业务代码中将 mock 数据作为兜底逻辑。",
+      "severity": "warn",
+      "category": "code-quality",
+      "source": ".agents/quality-checklist.md",
+      "check": {
+        "type": "content-regex-forbidden",
+        "params": {
+          "regex": "(mock|Mock|MOCK)\\s*(Data|data|List|list|Response|response|Result|result)"
+        }
+      },
+      "file_patterns": [
+        "*.ts",
+        "*.tsx",
+        "*.js",
+        "*.jsx",
+        "*.vue"
+      ],
+      "exclude_patterns": [
+        "*.test.*",
+        "*.spec.*",
+        "*.mock.*",
+        "mock/**",
+        "mocks/**",
+        "__mocks__/**"
+      ],
+      "message": "业务代码中检测到 mock 数据引用",
+      "suggestion": "请将 mock 数据移入测试文件或独立的 mock 目录，不要在业务逻辑中兜底。"
+    },
+    {
+      "id": "no-underscore-vars",
+      "name": "变量名禁止包含下划线",
+      "description": "变量名禁止包含下划线（解构忽略参数 _ 除外）。",
+      "severity": "warn",
+      "category": "style",
+      "source": ".agents/coding-standards/typescript.md",
+      "check": {
+        "type": "content-regex-forbidden",
+        "params": {
+          "regex": "\\b(let|const|var)\\s+[a-zA-Z0-9]*_[a-zA-Z0-9]*\\s*[=:]"
+        }
+      },
+      "file_patterns": [
+        "*.ts",
+        "*.tsx",
+        "*.js",
+        "*.jsx",
+        "*.vue"
+      ],
+      "exclude_patterns": [
+        "*.d.ts"
+      ],
+      "message": "变量名包含下划线，应使用 camelCase 命名",
+      "suggestion": "请将下划线变量名改为 camelCase 格式。解构忽略参数 _ 除外。"
+    },
+    {
+      "id": "read-before-write",
+      "name": "修改前先读取文件",
+      "description": "修改任何文件前必须先 Read 该文件当前内容，不能凭印象修改。",
+      "severity": "warn",
+      "category": "process",
+      "source": "AGENTS.md",
+      "check": {
+        "type": "read-before-write"
+      },
+      "file_patterns": [
+        "*"
+      ],
+      "exclude_patterns": [],
+      "message": "文件 {path} 在此次会话中未被读取，可能是凭印象修改",
+      "suggestion": "请先使用 Read 工具读取文件当前内容，确认后再修改。"
+    },
+    {
+      "id": "no-decorator-di-framework",
+      "name": "禁止引入装饰器 DI 框架",
+      "description": "ADR-017 选择 Fastify + 手写 composition root，不引入 NestJS 等装饰器框架。",
+      "severity": "warn",
+      "category": "architecture",
+      "source": "docs/architecture/模块边界与升级规则.md",
+      "check": {
+        "type": "content-regex-forbidden",
+        "params": {
+          "regex": "@nestjs/"
+        }
+      },
+      "file_patterns": [
+        "*.ts",
+        "*.tsx",
+        "*.js",
+        "*.jsx"
+      ],
+      "exclude_patterns": [
+        "*.d.ts"
+      ],
+      "message": "引入了 NestJS，违反 ADR-017",
+      "suggestion": "HTTP 层使用 Fastify；依赖装配集中在 packages/server/main.ts，不使用装饰器或运行时反射。若确需改选框架，先更新 ADR-017。"
+    }
+  ],
+  "tool_matchers": {
+    "claude_code": {
+      "write": "Write|Edit",
+      "read": "Read",
+      "config_path": ".claude/settings.json",
+      "config_format": "settings_json"
+    },
+    "kimi": {
+      "write": "write_to_file|replace_in_file|WriteFile|StrReplaceFile",
+      "read": "read_file|ReadFile",
+      "config_path": "config.toml",
+      "config_format": "toml"
+    },
+    "codex": {
+      "write": "write|edit|apply_patch",
+      "read": "read_file|Read",
+      "config_path": ".codex/hooks.json",
+      "config_format": "codex_hooks_json"
+    }
+  }
+}

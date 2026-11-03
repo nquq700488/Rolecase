@@ -1,0 +1,34 @@
+# .ccb — 默认全部忽略，仅放行需要版本控制的文件
+.ccb/*
+!.ccb/README.md
+!.ccb/ccb.config
+!.ccb/ccb-compact.config
+!.ccb/ccb-multi.config
+!.ccb/ccb_memory.md
+!.ccb/clean.sh
+!.ccb/restart.sh
+!.ccb/start.sh
+!.ccb/stop.sh
+
+# Guard 运行时状态
+tmp/ai-guard-reads-*.json
+.guard-configs/
+
+# Playwright 运行时状态
+.playwright-mcp/
+
+# Hook 执行日志（运行时生成，不提交）
+.hook-execution.log
+
+# Node / TypeScript 工程产物
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.pnpm-store/
+.rolecast/runtime/
+tests/contract/.tmp/
+
+# macOS metadata
+.DS_Store
+**/.DS_Store

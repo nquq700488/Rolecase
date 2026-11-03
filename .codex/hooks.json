@@ -1,0 +1,72 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash scripts/pre-edit-guard.sh --init-session"
+          },
+          {
+            "type": "command",
+            "command": "bash scripts/memory-reminder-guard.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "compact|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash scripts/session-reentry-guard.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "write|edit|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash scripts/pre-edit-guard.sh --check",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "read_file|Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash scripts/pre-edit-guard.sh --record-read",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "write|edit|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash scripts/pre-edit-guard.sh --mark-dirty",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash scripts/pre-edit-guard.sh --stop-nudge"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,2 @@
+# hook / CCB 脚本在 Windows 检出时保持 LF，避免 bash 因 CRLF 解析失败
+*.sh text eol=lf

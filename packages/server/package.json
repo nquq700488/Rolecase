@@ -1,0 +1,32 @@
+{
+  "name": "@rolecast/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "tsc",
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.90.0",
+    "@agentclientprotocol/codex-acp": "2.2.2",
+    "@fastify/websocket": "11.0.2",
+    "@rolecast/contract": "workspace:*",
+    "better-sqlite3": "11.10.0",
+    "fastify": "5.3.3",
+    "smol-toml": "1.9.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "7.6.12",
+    "@types/ws": "8.5.13",
+    "ws": "8.18.0"
+  }
+}

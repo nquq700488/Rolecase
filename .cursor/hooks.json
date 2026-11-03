@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "bash scripts/pre-edit-guard.sh --init-session"
+      }
+    ],
+    "preToolUse": [
+      {
+        "command": "bash scripts/pre-edit-guard.sh --check --output-format cursor",
+        "matcher": "Write|StrReplace|Edit|ApplyPatch"
+      }
+    ],
+    "postToolUse": [
+      {
+        "command": "bash scripts/pre-edit-guard.sh --record-read",
+        "matcher": "Read"
+      },
+      {
+        "command": "bash scripts/pre-edit-guard.sh --mark-dirty",
+        "matcher": "Write|StrReplace|Edit|ApplyPatch"
+      }
+    ],
+    "stop": [
+      {
+        "command": "bash scripts/pre-edit-guard.sh --stop-nudge --output-format cursor",
+        "loop_limit": 1
+      }
+    ]
+  }
+}

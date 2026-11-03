@@ -1,0 +1,10 @@
+packages:
+  - apps/*
+  - packages/*
+  - tests/*
+
+onlyBuiltDependencies:
+  - esbuild
+  - '@anthropic-ai/claude-agent-sdk'
+  - '@openai/codex'
+  - better-sqlite3
