@@ -4,7 +4,6 @@ import type { WebSocket } from 'ws'
 
 import {
   addAgentSlotRequestSchema,
-  apiErrorSchema,
   apiSuccessEnvelopeSchema,
   capabilitySnapshotSchema,
   codexConfigImportApplyRequestSchema,
@@ -25,15 +24,17 @@ import {
   runCommandReceiptSchema,
   runCommandRequestSchema,
   sendMessageRequestSchema,
+  setWorkspaceRootPathRequestSchema,
   updateProviderConnectionRequestSchema,
   updateRoleBindingRequestSchema,
   updateRoleRequestSchema,
+  workspaceRootPathDtoSchema,
   wsClientMessageSchema,
-  type ApiError,
   type EventEnvelope,
 } from '@rolecast/contract'
 
-import { ApplicationError, isCodedError } from '../application/errors.js'
+import type { ArtifactService } from '../application/artifacts/artifact-service.js'
+import type { MailboxService } from '../application/mailbox/mailbox-service.js'
 import type { ConversationService } from '../application/conversation/conversation-service.js'
 import type { CredentialService } from '../application/credentials/credential-service.js'
 import type { ProviderService } from '../application/providers/provider-service.js'
@@ -43,10 +44,15 @@ import type { EventBusPort } from '../application/ports/event-bus-port.js'
 import type { CodexConfigImportDraft } from '../application/ports/codex-config-import-port.js'
 import type { RepositoryPort } from '../application/ports/repository-port.js'
 import type { SessionService } from '../application/sessions/session-service.js'
+import { rejectEmptyRootPath, requestId, sendApiError, sendMappedError, sendValidationError } from './http-api-error.js'
+import { installArtifactRoutes } from './artifact-routes.js'
+import { installMailboxRoutes } from './mailbox-routes.js'
 import { LocalTokenService } from './local-token.js'
 
 /** HTTP/WS 装配所需的 Application 依赖。 */
 export interface HttpServerDependencies {
+  artifactService: ArtifactService
+  mailboxService: MailboxService
   workspaceService: WorkspaceService
   providerService: ProviderService
   credentialService: CredentialService
@@ -71,6 +77,8 @@ export async function createHttpApp(dependencies: HttpServerDependencies): Promi
   await app.register(websocketPlugin)
   installSecurityHooks(app, dependencies.localToken)
   installRoutes(app, dependencies)
+  installArtifactRoutes(app, dependencies.artifactService)
+  installMailboxRoutes(app, dependencies.mailboxService)
   return app
 }
 
@@ -128,6 +136,22 @@ function installRoutes(app: FastifyInstance, dependencies: HttpServerDependencie
   })
 
   app.post('/api/workspaces', async (request, reply) => {
+    if (
+      typeof request.body !== 'object' ||
+      request.body === null ||
+      !Object.hasOwn(request.body, 'root_path')
+    ) {
+      sendApiError(reply, 422, {
+        code: 'workspace_root_required',
+        message: '新建 Workspace 必须提供根目录路径',
+        details: {},
+        request_id: requestId(request),
+      })
+      return
+    }
+    if (rejectEmptyRootPath(request.body, reply, request)) {
+      return
+    }
     const parsed = createWorkspaceRequestSchema.safeParse(request.body)
     if (!parsed.success) {
       sendValidationError(reply, request, parsed.error.issues)
@@ -136,6 +160,34 @@ function installRoutes(app: FastifyInstance, dependencies: HttpServerDependencie
     try {
       const data = await dependencies.workspaceService.create(parsed.data)
       reply.code(201).send({ ok: true, data })
+    } catch (error: unknown) {
+      sendMappedError(reply, request, error)
+    }
+  })
+
+  app.get('/api/workspaces/:workspaceId/root-path', async (request, reply) => {
+    const params = request.params as Params
+    try {
+      const data = await dependencies.workspaceService.getRootPath(params.workspaceId ?? '')
+      reply.send({ ok: true, data: workspaceRootPathDtoSchema.parse(data) })
+    } catch (error: unknown) {
+      sendMappedError(reply, request, error)
+    }
+  })
+
+  app.post('/api/workspaces/:workspaceId/root-path', async (request, reply) => {
+    if (rejectEmptyRootPath(request.body, reply, request)) {
+      return
+    }
+    const parsed = setWorkspaceRootPathRequestSchema.safeParse(request.body)
+    if (!parsed.success) {
+      sendValidationError(reply, request, parsed.error.issues)
+      return
+    }
+    const params = request.params as Params
+    try {
+      const data = await dependencies.workspaceService.setRootPath(params.workspaceId ?? '', parsed.data)
+      reply.send({ ok: true, data: workspaceRootPathDtoSchema.parse(data) })
     } catch (error: unknown) {
       sendMappedError(reply, request, error)
     }
@@ -680,54 +732,6 @@ function parseVersionQuery(request: FastifyRequest, reply: FastifyReply): number
     return null
   }
   return value
-}
-
-function sendValidationError(
-  reply: FastifyReply,
-  request: FastifyRequest,
-  issues: readonly { path: PropertyKey[]; message: string }[],
-): void {
-  sendApiError(reply, 400, {
-    code: 'invalid_request',
-    message: '请求参数无效',
-    details: { issues: issues.map((issue) => ({ path: issue.path.map(String), message: issue.message })) },
-    request_id: requestId(request),
-  })
-}
-
-function sendMappedError(reply: FastifyReply, request: FastifyRequest, error: unknown): void {
-  const mapped = mapError(error, requestId(request))
-  sendApiError(reply, mapped.status, mapped.error)
-}
-
-function sendApiError(reply: FastifyReply, status: number, error: ApiError): void {
-  apiErrorSchema.parse(error)
-  reply.code(status).send({ ok: false, error })
-}
-
-function mapError(error: unknown, requestIdValue: string): { status: number; error: ApiError } {
-  if (error instanceof ApplicationError) {
-    return {
-      status: error.statusCode,
-      error: { code: error.code, message: error.message, details: error.details, request_id: requestIdValue },
-    }
-  }
-  const code = isCodedError(error) ? error.code : 'internal_error'
-  const status = code === 'permission_not_found' ? 404 : code === 'permission_timeout' ? 409 : 500
-  return {
-    status,
-    error: {
-      code,
-      message: status === 500 ? '服务内部错误' : '请求无法完成',
-      details: {},
-      request_id: requestIdValue,
-    },
-  }
-}
-
-function requestId(request: FastifyRequest): string {
-  const value = request.headers['x-request-id']
-  return typeof value === 'string' && value.length > 0 ? value : request.id
 }
 
 function isBearerTokenValid(authorization: string | undefined, token: LocalTokenService): boolean {

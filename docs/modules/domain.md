@@ -18,7 +18,8 @@ AgentSlot
 WorkflowTemplate
 Task
 Message
-Artifact
+ArtifactMetadata
+ArtifactContentRecord（私有 UTF-8 bytes，不进入公共 DTO）
 Run
 Event
 PermissionRequest
@@ -34,6 +35,7 @@ PermissionRequest
 
 ## 关键不变量
 
+- Workspace 的 `rootPath` 可为 null（迁移后的旧 Workspace）；非 null 值由 Application filesystem Port 校验并 canonicalize 后写入，Domain 本身不执行文件系统操作；
 - Task 只能分配给当前 Session 的 AgentSlot；
 - Role 属于且只能属于一个 Workspace，名称 trim 后不能为空；
 - RoleBinding 必须引用同一 Workspace 的 Role、ProviderConnection 和 Model；Model 必须属于指定 ProviderConnection；
@@ -41,7 +43,7 @@ PermissionRequest
 - RoleBinding 必须引用同一 Workspace 的 Role 和 Provider；
 - AgentSlot 的 provider/model 是创建时解析的有效快照，RoleBinding 变更不追溯修改既有 Slot；
 - Message 必须属于 Session，接收者只能是 Slot、用户或广播范围；
-- Artifact 必须有 Task 或用户来源；
+- inline Artifact metadata 必须关联 Workspace、Session、唯一 completed Task 与 completed 来源 Run；内容 bytes 仅存在于私有持久化记录，不放入公共 DTO；
 - Run 进入终态后不能接受新 Task；
 - PermissionRequest 只能从 `pending` 转为 `answered` 或 `expired`，过期后不能再回答；
 - PermissionRequest 硬超时必须关联 `Run.interrupted`，不能静默变为 completed；
@@ -93,4 +95,4 @@ Domain 不知道外部 Provider 的真实能力，能力差异由 Providers 和 
 
 ## Web Phase 2/3 目标状态机（未实现）
 
-目标态：`TaskStatus` 增加 `starting`（派发准备）与 `blocked`（依赖未满足），补充 `queued→blocked→queued`、`blocked→failed/dependency_failed`、`queued→starting→running` 转换；Task 增加 `node_key`/`attempt`/`retry_of_task_id` 与依赖边。Run 状态 union 不变，按 ADR 第 2.2 节聚合；Task retry 与 Run retry 的边界、at-least-once 确认见 ADR 第 2.4 节。当前 Domain 仍只有既有状态与转换。
+目标态：`TaskStatus` 增加 `starting`（派发准备）与 `blocked`（依赖未满足），补充 `queued→blocked→queued`、`blocked→failed/dependency_failed`、`queued→starting→running` 转换；Task 增加 `node_key`/`attempt`/`retry_of_task_id` 与依赖边。Run 状态 union 不变，按 ADR 第 2.2 节聚合；Task retry 与 Run retry 的边界、at-least-once 确认见 ADR 第 2.4 节。当前 Domain 仍只有既有状态与转换；Workspace nullable `rootPath` 已进入领域对象，但路径校验由 Application Port 负责。

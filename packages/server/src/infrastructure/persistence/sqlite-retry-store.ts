@@ -83,11 +83,28 @@ export class SqliteRetryStore {
       if (claim !== undefined && claim.run_id !== parentRunId) {
         return null
       }
-      const input = this.database
-        .prepare('SELECT input_message_id FROM tasks WHERE run_id = ?')
-        .get(parentRunId) as { input_message_id?: string | null } | undefined
-      const inputMessageId = input?.input_message_id
-      if (inputMessageId === undefined || inputMessageId === null) {
+      const parentTasks = this.database
+        .prepare('SELECT id, input_message_id, node_key, attempt FROM tasks WHERE run_id = ?')
+        .all(parentRunId) as Array<{
+          id: string
+          input_message_id: string | null
+          node_key: string | null
+          attempt: number | null
+        }>
+      const parentTask = parentTasks[0]
+      if (
+        parentTasks.length !== 1
+        || parentTask === undefined
+        || typeof parentTask.node_key !== 'string'
+        || parentTask.node_key.length === 0
+        || typeof parentTask.attempt !== 'number'
+        || !Number.isSafeInteger(parentTask.attempt)
+        || parentTask.attempt <= 0
+      ) {
+        return null
+      }
+      const inputMessageId = parentTask.input_message_id
+      if (inputMessageId === null) {
         throw new Error('retry Context source message is missing')
       }
       this.database
@@ -97,7 +114,11 @@ export class SqliteRetryStore {
                     updated_at = excluded.updated_at`)
         .run(task.slot_id, run.id, now)
       insertRun(this.database, { ...run, retry_of_run_id: parentRunId }, chainId)
-      insertTask(this.database, task, inputMessageId)
+      insertTask(this.database, task, inputMessageId, {
+        nodeKey: parentTask.node_key,
+        attempt: 1,
+        retryOfTaskId: parentTask.id,
+      })
       insertTaskContextSources(this.database, task.id, task.slot_id, inputMessageId, task.created_at)
       const changed = this.database
         .prepare(`UPDATE command_receipts SET run_id = ?, task_id = ?, message_id = ?, updated_at = ?

@@ -36,7 +36,11 @@ SessionDto
 AgentSlotDto
 WorkflowDto
 TaskDto
-ArtifactDto
+ArtifactCreateRequest
+ArtifactPageQuery（metadata 分页查询，limit 默认 50、最大 100）
+ArtifactPageDto（仅 metadata items 与 nullable next_cursor）
+ArtifactDto（仅 metadata）
+ArtifactContentDto（独立内容响应）
 RunDto
 EventDto
 PermissionRequestDto
@@ -173,6 +177,6 @@ Contract 不负责语义级业务校验，语义校验由 Domain 和 Application
 - 错误码稳定性；
 - 事件 Schema 版本。
 
-## Web Phase 2/3 目标契约（未实现）
+## Web Phase 2/3 契约（部分实现）
 
-目标态（见 `docs/architecture/Stage0-Web-Phase2-3-ADR.md`）：`TaskStatus` 增加 `starting`、`blocked`；`RunStatus` 不增加 `blocked`。新增 `WorkspaceRootPathDto`（保持旧 `WorkspaceDto` 形状）、Workspace 创建 `root_path` 与一次性补设请求、handoff `source_task_id`、Artifact/Workflow/Mailbox DTO 及错误码。当前 v1 Contract 未包含这些字段，旧客户端严格解析行为保持不变。
+Stage 0 契约见 `docs/architecture/Stage0-Web-Phase2-3-ADR.md`。Workspace 创建的 `root_path` 请求、一次性补设请求与 `WorkspaceRootPathDto` 已实现，并保持既有 `WorkspaceDto` 响应形状；旧客户端仍可读取 Workspace，但创建请求必须升级。其余目标仍包括 `TaskStatus` 的 `starting`、`blocked`（`RunStatus` 不新增 `blocked`）、handoff `source_task_id` 与 Workflow DTO。Mailbox 严格 Contract 已实现（`packages/contract/src/mailbox-schemas.ts`）：不含正文的摘要页/查询（`slot_id` 必填、`limit` 1–100、可选 `cursor`）、单条详情、mark-read 请求/响应与 metadata-only `message.read` payload；稳定错误码 `mailbox_message_unavailable`。Artifact Contract 已新增严格的 `{ source_run_id, request_id }` 创建请求、仅含 metadata 的 `ArtifactDto`、单独返回文本的 `ArtifactContentDto`，以及 Session-scoped metadata page query/page DTO（`limit` 默认 50、最大 100，可选 cursor）；Artifact 稳定错误码见 `docs/modules/artifacts.md`。

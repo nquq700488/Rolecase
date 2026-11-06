@@ -30,6 +30,25 @@ import {
   updateProviderConnectionRequestSchema,
   updateRoleRequestSchema,
   wsClientMessageSchema,
+  setWorkspaceRootPathRequestSchema,
+  workspaceRootPathDtoSchema,
+  artifactContentDtoSchema,
+  artifactDtoSchema,
+  artifactPageDtoSchema,
+  artifactPageQuerySchema,
+  artifactParamsSchema,
+  artifactSessionParamsSchema,
+  createArtifactRequestSchema,
+  mailboxMessageSummaryDtoSchema,
+  mailboxPageDtoSchema,
+  mailboxPageQuerySchema,
+  mailboxMessageDetailDtoSchema,
+  mailboxMarkReadRequestSchema,
+  mailboxMarkReadDtoSchema,
+  mailboxMessageReadEventPayloadSchema,
+  mailboxParamsSchema,
+  mailboxMessageParamsSchema,
+  MAILBOX_ERROR_CODES,
 } from './index.js'
 
 describe('Contract Schema', () => {
@@ -240,8 +259,54 @@ describe('Contract Schema', () => {
     expect(ERROR_CODES.context_source_missing).toBe('context_source_missing')
   })
 
-  it('验证 Phase 1A 的 Workspace、Session 和消息请求', () => {
-    expect(createWorkspaceRequestSchema.safeParse({ name: '演示工作区' }).success).toBe(true)
+  it('创建 Workspace 必须包含非空根目录路径并拒绝未知字段', () => {
+    expect(createWorkspaceRequestSchema.safeParse({
+      name: '演示工作区',
+      root_path: '/tmp/rolecast-workspace',
+    }).success).toBe(true)
+    expect(createWorkspaceRequestSchema.safeParse({ name: '演示工作区' }).success).toBe(false)
+    expect(createWorkspaceRequestSchema.safeParse({
+      name: '演示工作区',
+      root_path: '',
+    }).success).toBe(false)
+    expect(createWorkspaceRequestSchema.safeParse({
+      name: '演示工作区',
+      root_path: '/tmp/rolecast-workspace',
+      unexpected: true,
+    }).success).toBe(false)
+  })
+
+  it('WorkspaceRootPathDto 严格区分未配置与已配置状态', () => {
+    expect(workspaceRootPathDtoSchema.safeParse({
+      workspace_id: 'workspace-001',
+      root_path: null,
+    }).success).toBe(true)
+    expect(workspaceRootPathDtoSchema.safeParse({
+      workspace_id: 'workspace-001',
+      root_path: '/srv/rolecast/workspace',
+    }).success).toBe(true)
+    expect(workspaceRootPathDtoSchema.safeParse({
+      workspace_id: 'workspace-001',
+      root_path: null,
+      extra: true,
+    }).success).toBe(false)
+  })
+
+  it('补设 Workspace 根目录只接受严格的非空 root_path', () => {
+    expect(setWorkspaceRootPathRequestSchema.safeParse({ root_path: '/srv/workspace' }).success).toBe(true)
+    expect(setWorkspaceRootPathRequestSchema.safeParse({ root_path: '' }).success).toBe(false)
+    expect(setWorkspaceRootPathRequestSchema.safeParse({ root_path: '/srv/workspace', extra: true }).success)
+      .toBe(false)
+  })
+
+  it('公开 Workspace 根目录稳定错误码', () => {
+    expect(ERROR_CODES.workspace_root_required).toBe('workspace_root_required')
+    expect(ERROR_CODES.workspace_root_invalid).toBe('workspace_root_invalid')
+    expect(ERROR_CODES.workspace_root_duplicate).toBe('workspace_root_duplicate')
+    expect(ERROR_CODES.workspace_root_already_configured).toBe('workspace_root_already_configured')
+  })
+
+  it('验证 Phase 1A 的 Session 和消息请求', () => {
     const legacySession = {
       name: '第一次对话',
       provider_connection_id: 'provider-001',
@@ -291,6 +356,16 @@ describe('Contract Schema', () => {
     expect(ERROR_CODES.source_history_unavailable).toBe('source_history_unavailable')
     expect(ERROR_CODES.source_event_payload_too_large).toBe('source_event_payload_too_large')
     expect(ERROR_CODES.handoff_content_too_large).toBe('handoff_content_too_large')
+  })
+
+  it('接受可选且非空的 handoff 来源 Task ID', () => {
+    const request = {
+      source_run_id: 'run-001',
+      target_slot_id: 'slot-002',
+      request_id: 'handoff-key',
+    }
+    expect(handoffRequestSchema.safeParse({ ...request, source_task_id: 'task-001' }).success).toBe(true)
+    expect(handoffRequestSchema.safeParse({ ...request, source_task_id: '' }).success).toBe(false)
   })
 
   it('只允许通过选项 ID 回答权限请求', () => {
@@ -530,5 +605,202 @@ describe('Contract Schema', () => {
         config_revision: 1,
       }).success).toBe(false)
     }
+  })
+
+  it('Artifact 创建请求只接受来源 Run 与 request_id', () => {
+    expect(createArtifactRequestSchema.safeParse({
+      source_run_id: 'run-001',
+      request_id: 'request-001',
+    }).success).toBe(true)
+
+    for (const payload of [
+      { source_run_id: 'run-001' },
+      { request_id: 'request-001' },
+      { source_run_id: '', request_id: 'request-001' },
+      { source_run_id: 'run-001', request_id: 'request-001', task_id: 'task-001' },
+    ]) {
+      expect(createArtifactRequestSchema.safeParse(payload).success).toBe(false)
+    }
+  })
+
+  it('Artifact 路由参数为 strict 且要求非空标识符', () => {
+    expect(artifactSessionParamsSchema.safeParse({ sessionId: 'session-001' }).success).toBe(true)
+    expect(artifactParamsSchema.safeParse({ sessionId: 'session-001', artifactId: 'artifact-001' }).success).toBe(true)
+    expect(artifactSessionParamsSchema.safeParse({ sessionId: '' }).success).toBe(false)
+    expect(artifactParamsSchema.safeParse({ sessionId: 'session-001', artifactId: '' }).success).toBe(false)
+    expect(artifactParamsSchema.safeParse({ sessionId: 'session-001', artifactId: 'artifact-001', extra: true }).success).toBe(false)
+  })
+
+  it('Artifact metadata 只接受 inline 元数据并限制 SHA-256 与字节大小', () => {
+    const metadata = {
+      id: 'artifact-001',
+      workspace_id: 'workspace-001',
+      session_id: 'session-001',
+      task_id: 'task-001',
+      source_run_id: 'run-001',
+      media_type: 'text/plain; charset=utf-8',
+      storage_kind: 'inline',
+      status: 'ready',
+      size_bytes: 65_536,
+      sha256: 'a'.repeat(64),
+      created_at: '2026-11-04T10:00:00.000Z',
+    }
+
+    expect(artifactDtoSchema.safeParse(metadata).success).toBe(true)
+    expect(artifactDtoSchema.safeParse({ ...metadata, content_ref: 'artifacts/a.txt' }).success).toBe(false)
+    expect(artifactDtoSchema.safeParse({ ...metadata, size_bytes: 65_537 }).success).toBe(false)
+    expect(artifactDtoSchema.safeParse({ ...metadata, sha256: 'not-a-digest' }).success).toBe(false)
+  })
+
+  it('Artifact 内容 DTO 独立返回文本且错误码保持稳定', () => {
+    expect(artifactContentDtoSchema.safeParse({
+      artifact_id: 'artifact-001',
+      media_type: 'text/plain; charset=utf-8',
+      content: '脱敏后的正文',
+    }).success).toBe(true)
+    expect(artifactContentDtoSchema.safeParse({
+      artifact_id: 'artifact-001',
+      media_type: 'text/plain; charset=utf-8',
+      content: '脱敏后的正文',
+      sha256: 'a'.repeat(64),
+    }).success).toBe(false)
+    expect(ERROR_CODES.artifact_unavailable).toBe('artifact_unavailable')
+    expect(ERROR_CODES.artifact_sanitization_failed).toBe('artifact_sanitization_failed')
+  })
+
+  it('Artifact 分页查询默认 limit=50、最大 100，且响应只包含 metadata', () => {
+    expect(artifactPageQuerySchema.parse({})).toEqual({ limit: 50 })
+    expect(artifactPageQuerySchema.parse({ limit: '100', cursor: 'artifact-001' })).toEqual({
+      limit: 100,
+      cursor: 'artifact-001',
+    })
+    for (const query of [
+      { limit: '0' },
+      { limit: '101' },
+      { limit: 'not-a-number' },
+      { cursor: '' },
+      { content: 'must-not-be-listed' },
+    ]) {
+      expect(artifactPageQuerySchema.safeParse(query).success).toBe(false)
+    }
+
+    const metadata = {
+      id: 'artifact-001',
+      workspace_id: 'workspace-001',
+      session_id: 'session-001',
+      task_id: 'task-001',
+      source_run_id: 'run-001',
+      media_type: 'text/plain; charset=utf-8',
+      storage_kind: 'inline',
+      status: 'ready',
+      size_bytes: 4,
+      sha256: 'a'.repeat(64),
+      created_at: '2026-11-04T10:00:00.000Z',
+    }
+    expect(artifactPageDtoSchema.safeParse({ items: [metadata], next_cursor: null }).success).toBe(true)
+    expect(artifactPageDtoSchema.safeParse({
+      items: [{ ...metadata, content: 'body' }],
+      next_cursor: null,
+    }).success).toBe(false)
+    expect(artifactPageDtoSchema.safeParse({ items: [], next_cursor: 'artifact-001', extra: true }).success)
+      .toBe(false)
+  })
+
+  it('Mailbox 分页查询有默认上限且拒绝非法参数', () => {
+    expect(mailboxPageQuerySchema.parse({ slot_id: 'slot-001' })).toEqual({
+      slot_id: 'slot-001',
+      limit: 50,
+    })
+    expect(mailboxPageQuerySchema.parse({ slot_id: 'slot-001', limit: '100', cursor: 'message-001' })).toEqual({
+      slot_id: 'slot-001',
+      limit: 100,
+      cursor: 'message-001',
+    })
+    for (const query of [
+      { slot_id: 'slot-001', limit: '0' },
+      { slot_id: 'slot-001', limit: '101' },
+      { slot_id: 'slot-001', limit: 'not-a-number' },
+      { slot_id: 'slot-001', cursor: '' },
+      { slot_id: 'slot-001', unexpected: 'value' },
+    ]) {
+      expect(mailboxPageQuerySchema.safeParse(query).success).toBe(false)
+    }
+  })
+
+  it('Mailbox 摘要状态与 read_at 一致且不包含正文', () => {
+    const summary = {
+      id: 'message-001',
+      session_id: 'session-001',
+      sender_id: 'slot-001',
+      to_slot_id: 'slot-002',
+      created_at: '2026-11-04T10:00:00.000Z',
+      status: 'unread',
+      read_at: null,
+    }
+    expect(mailboxMessageSummaryDtoSchema.safeParse(summary).success).toBe(true)
+    expect(mailboxMessageSummaryDtoSchema.safeParse({
+      ...summary,
+      status: 'read',
+      read_at: '2026-11-04T10:01:00.000Z',
+    }).success).toBe(true)
+    expect(mailboxMessageSummaryDtoSchema.safeParse({ ...summary, read_at: '2026-11-04T10:01:00.000Z' }).success)
+      .toBe(false)
+    expect(mailboxMessageSummaryDtoSchema.safeParse({ ...summary, content: '正文不可出现在摘要' }).success)
+      .toBe(false)
+    expect(mailboxMessageSummaryDtoSchema.safeParse({ ...summary, status: 'delivered' }).success).toBe(false)
+
+    expect(mailboxPageDtoSchema.safeParse({ items: [summary], next_cursor: 'message-001' }).success).toBe(true)
+    expect(mailboxPageDtoSchema.safeParse({ items: [], next_cursor: null }).success).toBe(true)
+    expect(mailboxPageDtoSchema.safeParse({ items: [], next_cursor: null, unread_count: 1 }).success).toBe(false)
+  })
+
+  it('Mailbox 详情、标记已读及 message.read Event 使用严格的 metadata 契约', () => {
+    const timestamp = '2026-11-04T10:01:00.000Z'
+    const detail = {
+      message: {
+        id: 'message-001',
+        session_id: 'session-001',
+        run_id: 'run-001',
+        sender_kind: 'agent',
+        sender_id: 'slot-001',
+        content: '仅在详情中返回的正文',
+        created_at: '2026-11-04T10:00:00.000Z',
+        kind: 'handoff',
+        to_slot_id: 'slot-002',
+      },
+      status: 'read',
+      read_at: timestamp,
+    }
+    expect(mailboxMessageDetailDtoSchema.safeParse(detail).success).toBe(true)
+    expect(mailboxMessageDetailDtoSchema.safeParse({ ...detail, status: 'unread' }).success).toBe(false)
+    expect(mailboxMarkReadRequestSchema.safeParse({ slot_id: 'slot-002' }).success).toBe(true)
+    expect(mailboxMarkReadRequestSchema.safeParse({ slot_id: 'slot-002', content: 'unexpected' }).success).toBe(false)
+    expect(mailboxMarkReadDtoSchema.safeParse({
+      message_id: 'message-001',
+      status: 'read',
+      read_at: timestamp,
+      event_bus_status: 'failed',
+    }).success).toBe(true)
+    expect(mailboxMarkReadDtoSchema.safeParse({
+      message_id: 'message-001',
+      status: 'unread',
+      read_at: null,
+      event_bus_status: 'published',
+    }).success).toBe(false)
+    expect(mailboxMessageReadEventPayloadSchema.safeParse({
+      message_id: 'message-001',
+      recipient_slot_id: 'slot-002',
+      read_at: timestamp,
+    }).success).toBe(true)
+    expect(mailboxMessageReadEventPayloadSchema.safeParse({
+      message_id: 'message-001',
+      recipient_slot_id: 'slot-002',
+      read_at: timestamp,
+      content: '正文不能进入事件',
+    }).success).toBe(false)
+    expect(mailboxParamsSchema.safeParse({ sessionId: 'session-001' }).success).toBe(true)
+    expect(mailboxMessageParamsSchema.safeParse({ sessionId: 'session-001', messageId: 'message-001' }).success)
+      .toBe(true)
+    expect(MAILBOX_ERROR_CODES.mailbox_message_unavailable).toBe('mailbox_message_unavailable')
   })
 })

@@ -12,6 +12,7 @@ import {
   type SessionSnapshotDto,
   type TaskDto,
   type WorkspaceDto,
+  type WorkspaceRootPathDto,
 } from '@rolecast/contract'
 
 import type {
@@ -35,17 +36,17 @@ import {
   toRun,
   toSession,
   toTask,
-  toWorkspace,
 } from './sqlite-mappers.js'
 import { SqliteDatabase } from './sqlite-database.js'
 import { appendHandoffMetadataEventSync, appendRunScopedEventSync } from './sqlite-event-sequence.js'
 import { SqlitePermissionEventStore } from './sqlite-permission-event-store.js'
 import { SqlitePermissionRecoveryStore } from './sqlite-permission-recovery-store.js'
 import { SqliteProviderStore } from './sqlite-provider-store.js'
-import { SqliteRunClosureStore } from './sqlite-run-closure.js'
+import { SqliteRunClosureStore, saveTaskWithDefaultLineage } from './sqlite-run-closure.js'
 import { SqliteSlotLifecycleStore } from './sqlite-slot-lifecycle-store.js'
 import { SqliteRetryStore } from './sqlite-retry-store.js'
 import { SqliteHandoffStore } from './sqlite-handoff-store.js'
+import { SqliteWorkspaceStore } from './sqlite-workspace-store.js'
 
 type Row = Record<string, unknown>
 
@@ -74,6 +75,7 @@ export class SqliteRepository implements RepositoryPort {
   private readonly slotLifecycle: SqliteSlotLifecycleStore
   private readonly retryStore: SqliteRetryStore
   private readonly handoffs: SqliteHandoffStore
+  private readonly workspaces: SqliteWorkspaceStore
 
   constructor(
     private readonly database: SqliteDatabase,
@@ -83,6 +85,7 @@ export class SqliteRepository implements RepositoryPort {
     this.slotLifecycle = new SqliteSlotLifecycleStore(database)
     this.retryStore = new SqliteRetryStore(database)
     this.handoffs = new SqliteHandoffStore(database)
+    this.workspaces = new SqliteWorkspaceStore(database)
     this.providers = new SqliteProviderStore(database)
   }
 
@@ -219,28 +222,31 @@ export class SqliteRepository implements RepositoryPort {
     return this.retryStore.createRetryTurn(...args)
   }
 
-  async createWorkspace(workspace: WorkspaceDto): Promise<WorkspaceDto> {
-    this.database
-      .prepare(
-        `INSERT INTO workspaces(id, name, created_at, updated_at)
-         VALUES (@id, @name, @created_at, @updated_at)`,
-      )
-      .run(workspace)
-    return workspace
+  createWorkspace(workspace: WorkspaceDto): Promise<WorkspaceDto> {
+    return Promise.resolve(this.workspaces.create(workspace))
   }
 
-  async listWorkspaces(): Promise<WorkspaceDto[]> {
-    const rows = this.database
-      .prepare('SELECT id, name, created_at, updated_at FROM workspaces ORDER BY updated_at DESC, id')
-      .all() as Row[]
-    return rows.map(toWorkspace)
+  createWorkspaceWithRootPath(workspace: WorkspaceDto, rootPath: string): Promise<'created' | 'duplicate'> {
+    return Promise.resolve(this.workspaces.createWithRootPath(workspace, rootPath))
   }
 
-  async getWorkspace(id: string): Promise<WorkspaceDto | null> {
-    const row = this.database
-      .prepare('SELECT id, name, created_at, updated_at FROM workspaces WHERE id = ?')
-      .get(id) as Row | undefined
-    return row === undefined ? null : toWorkspace(row)
+  getWorkspaceRootPath(id: string): Promise<WorkspaceRootPathDto | null> {
+    return Promise.resolve(this.workspaces.getRootPath(id))
+  }
+
+  setWorkspaceRootPathIfUnconfigured(
+    id: string,
+    rootPath: string,
+  ): Promise<'configured' | 'duplicate' | 'already_configured' | 'not_found'> {
+    return Promise.resolve(this.workspaces.setRootPathIfUnconfigured(id, rootPath))
+  }
+
+  listWorkspaces(): Promise<WorkspaceDto[]> {
+    return Promise.resolve(this.workspaces.list())
+  }
+
+  getWorkspace(id: string): Promise<WorkspaceDto | null> {
+    return Promise.resolve(this.workspaces.get(id))
   }
 
 
@@ -366,11 +372,12 @@ export class SqliteRepository implements RepositoryPort {
       this.database
         .prepare(
           `INSERT INTO tasks(
-            id, workspace_id, session_id, run_id, slot_id, title, status, created_at, updated_at
+            id, workspace_id, session_id, run_id, slot_id, title, status,
+            node_key, attempt, retry_of_task_id, created_at, updated_at
           ) VALUES (@id, @workspace_id, @session_id, @run_id, @slot_id, @title, @status,
-            @created_at, @updated_at)`,
+            @node_key, @task_attempt, @retry_of_task_id, @created_at, @updated_at)`,
         )
-        .run(task)
+        .run({ ...task, node_key: 'agent', task_attempt: 1, retry_of_task_id: null })
       this.database
         .prepare(
           `INSERT INTO messages(id, session_id, run_id, sender_kind, sender_id, content, created_at)
@@ -414,18 +421,7 @@ export class SqliteRepository implements RepositoryPort {
   }
 
   async saveTask(task: TaskDto): Promise<TaskDto> {
-    this.database
-      .prepare(
-        `INSERT INTO tasks(
-          id, workspace_id, session_id, run_id, slot_id, title, status, created_at, updated_at
-        ) VALUES (@id, @workspace_id, @session_id, @run_id, @slot_id, @title, @status,
-          @created_at, @updated_at)
-        ON CONFLICT(id) DO UPDATE SET
-          title = excluded.title,
-          status = excluded.status,
-          updated_at = excluded.updated_at`,
-      )
-      .run(task)
+    saveTaskWithDefaultLineage(this.database, task)
     return task
   }
 

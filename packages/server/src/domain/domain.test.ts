@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest'
 import {
   createRun,
   createTask,
+  createInlineArtifactContent,
+  MAX_INLINE_ARTIFACT_SIZE_BYTES,
   transitionRun,
   transitionTask,
   type Run,
@@ -77,5 +79,25 @@ describe('Domain 状态机', () => {
 
     expect(() => transitionRun(run, 'running', now)).toThrowError('Run 状态不可转换')
     expect(() => transitionTask(task, 'running', now)).toThrowError('Task 状态不可转换')
+  })
+
+  it('创建 inline Artifact 内容时复制来源 bytes 并接受上限', () => {
+    const source = new Uint8Array([1, 2, 3])
+    const artifactContent = createInlineArtifactContent({
+      artifactId: 'artifact-001',
+      bytes: source,
+    })
+
+    source[0] = 9
+    expect(MAX_INLINE_ARTIFACT_SIZE_BYTES).toBe(65_536)
+    expect(artifactContent.bytes).toEqual(new Uint8Array([1, 2, 3]))
+    expect(artifactContent.bytes).not.toBe(source)
+  })
+
+  it('拒绝超过 inline Artifact 字节上限的内容', () => {
+    expect(() => createInlineArtifactContent({
+      artifactId: 'artifact-001',
+      bytes: new Uint8Array(MAX_INLINE_ARTIFACT_SIZE_BYTES + 1),
+    })).toThrowError('Artifact inline 内容超过 65,536 字节')
   })
 })

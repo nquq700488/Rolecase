@@ -27,10 +27,13 @@ hard_timeout_action: expire_and_interrupt
 
 约束：
 
-- `root_path` 必须由用户明确选择；
-- 规范化后的同一路径只能有一个活动 Workspace；
-- 文件访问不得超出 Workspace 根路径，除非用户显式授权；
+- `root_path` nullable：新建 Workspace 必须由用户明确提供现存目录绝对路径；迁移后的旧 Workspace 保持 NULL，禁止从 cwd 或数据库位置推断；
+- Application filesystem Port 校验服务端可访问性并保存 canonical path；配置路径不创建目录、不读取目录内容；
+- canonical path 全局唯一，由 SQLite 非 NULL 唯一索引兜底；旧 Workspace 只允许通过 CAS 执行一次 NULL→path 补设；
+- 文件访问不得超出 Workspace 根路径，除非用户显式授权；此配置校验不代表 Artifact 文件操作已通过目录句柄安全 Gate；
 - 删除 Workspace 不默认删除源代码，只删除 Rolecast 管理的状态。
+
+`WorkspaceDto` 不包含 `root_path`；独立 `WorkspaceRootPathDto { workspace_id, root_path: string | null }` 由根路径 API 返回。
 
 ## 2. ProviderDefinition
 
@@ -213,29 +216,19 @@ Task
 ```
 
 ```text
-Artifact
-├── id
-├── session_id
-├── task_id?                  # 用户直接创建时为空
-├── type
-├── title
-├── content_ref
-├── summary
-├── created_by: user | slot
-├── input_artifact_ids[]
-├── checksum
+Artifact（当前获批的 inline 切片）
+├── id / workspace_id / session_id
+├── task_id / source_run_id
+├── media_type = text/plain; charset=utf-8
+├── storage_kind = inline / status = ready
+├── size_bytes（UTF-8，最大 65,536）
+├── sha256
 └── created_at
 ```
 
-大型内容写入文件，数据库保存引用、摘要和校验值。
+当前仅接受同 Session 中 completed Run 的唯一 completed Task 输出，脱敏后以 BLOB 存 SQLite；内容不进入 metadata DTO 或 Event。脱敏前、脱敏后都按 UTF-8 byte length 限制，超限拒绝且不转成文件。读取时校验 BLOB 长度、记录大小与 SHA-256；失败统一按 `artifact_unavailable` 处理，不返回损坏内容。
 
-内容存放规则：
-
-- 阈值 **64 KiB**：`content` 不超过阈值时直接入库，超过则写文件；
-- 文件路径：`<workspace>/.rolecast/artifacts/<session_id>/<artifact_id>`；
-- `content_ref` 存**相对 Workspace 根的路径**，不存绝对路径；
-- `checksum` 用 SHA-256，用于校验与去重；
-- 读取时校验 checksum，不匹配按 `artifact_unavailable` 处理，不返回损坏内容。
+后续文件 Artifact 目标路径曾规划为 `<workspace>/.rolecast/artifacts/<session_id>/<artifact_id>`，并以 Workspace-relative `content_ref` 引用；这不是当前实现或授权范围。文件写入需另行通过目录句柄能力 Gate，禁止 realpath 后绝对路径 fallback。
 
 ## 8. Message、Run、Event 和 PermissionRequest
 
@@ -454,6 +447,16 @@ GET    /api/runs/:runId/tasks                                  # 规划中
 GET    /api/runs/:runId/artifacts                              # 规划中
 GET    /api/runs/:runId/events                                 # 规划中
 ```
+
+#### Session-scoped Artifact metadata 页面
+
+```text
+GET /api/sessions/:sessionId/artifacts?limit=&cursor=                  # 已实现，metadata-only 分页
+GET /api/sessions/:sessionId/artifacts/:artifactId                     # 已实现，metadata-only
+GET /api/sessions/:sessionId/artifacts/:artifactId/content             # 已实现，显式按需读取纯文本
+```
+
+页面默认 `limit=50`、上限 100，按 `created_at DESC, id DESC` keyset 分页，复用现有 `artifacts_workspace_session_idx(workspace_id, session_id, created_at, id)`，无需新 migration。首屏/翻页不取正文；Web 用户显式打开单项后才请求独立 content endpoint，并以纯文本显示，不解析 HTML/Markdown。不存在或跨 Session cursor 使用统一 `artifact_unavailable`。
 
 ### Messages and permissions
 
@@ -679,14 +682,15 @@ WebSocket 断线后：
 
 `POST /api/sessions/:sessionId/handoffs` 从已完成 Run 的持久化 Agent 输出创建 handoff Message；MessageDto 新增兼容可选 `kind`（`handoff`）与 `to_slot_id`，`sender_id` 表示来源 Slot。私有 `handoff_request_id` 不进入 DTO/API，v8 中以 Session-scoped 部分唯一索引保证幂等。Run 私有 `event_sequence`/`completed_sequence` 不进入公共 DTO；handoff 读取严格止于完成水位，旧 Run 或水位缺失返回 `409 source_history_unavailable`。`audience`、read/status 与 Artifact 引用仍为后续范围。
 
-## Web Phase 2/3 Stage 0 目标契约（未实现）
+## Web Phase 2/3 Stage 0 契约（部分实现）
 
-Stage 0 冻结的完整契约见 `Stage0-Web-Phase2-3-ADR.md`；本节只登记与现有 API/数据模型的差异，全部为**目标态**，当前代码尚未实现：
+Stage 0 冻结的完整契约见 `Stage0-Web-Phase2-3-ADR.md`；Workspace 根路径切片已实现，inline Artifact 已获批作为当前服务端切片；其余条目仍为目标态：
 
-- Task 状态新增 `starting`、`blocked`；Run 不新增 `blocked`。Task 增加 `node_key`、`attempt`、`retry_of_task_id`，唯一 `(run_id, node_key, attempt)`；Event payload 目标携带 `run_id + task_id + node_key + attempt`。
-- `WorkspaceDto` 响应形状不变；新建 Workspace 请求要求 `root_path`，新增 `WorkspaceRootPathDto` 与 `GET/POST /api/workspaces/:workspaceId/root-path` 一次性补设；错误 `workspace_root_required`、`workspace_root_invalid`、`workspace_root_duplicate`、`workspace_root_already_configured`、`workspace_root_unconfigured`。
+- Task 状态目标新增 `starting`、`blocked`；Run 不新增 `blocked`。Task 增加 `node_key`、`attempt`、`retry_of_task_id`，唯一 `(run_id, node_key, attempt)`；Event payload 目标携带 `run_id + task_id + node_key + attempt`。
+- `WorkspaceDto` 响应形状不变；新建 Workspace 请求要求 `root_path`，独立 `WorkspaceRootPathDto` 及 `GET/POST /api/workspaces/:workspaceId/root-path` 已实现；错误 `workspace_root_required`、`workspace_root_invalid`、`workspace_root_duplicate`、`workspace_root_already_configured` 已实现。`workspace_root_unconfigured` 仍是未来 Artifact 门禁错误。
 - handoff 请求增加可选 `source_task_id`；多 Task Run 必填，错误 `source_task_required` / `source_task_invalid`。
-- Artifact 模块（`docs/modules/artifacts.md`）：64 KiB inline / 文件双路径、`content_ref`、SHA-256、intent/staging/rename/ready 与崩溃恢复；文件写入因目录句柄能力未证明保持 BLOCKED。
-- 容量错误 `scheduler_capacity_reached`（429）、`permission_capacity_exceeded`、`capacity_overcommitted`；0B 测试注入测量能力已获批准（未实现），Q/P/N 由 0C 用户批准；生产 admission 在批准前 fail-closed。
+- Artifact 模块（`docs/modules/artifacts.md`）：当前服务端切片仅为 SQLite inline UTF-8 文本（≤65,536 bytes）、completed Run/Task 来源、脱敏、幂等、SHA-256 与独立 metadata/content API；超限拒绝，不转文件。Workspace root migration v9 已实现，Artifact 表使用 v10。文件模式、`content_ref`、intent/staging/rename/recovery 仍属后续设计且因目录句柄能力未证明保持 BLOCKED。
+- 容量错误 `scheduler_capacity_reached`（429）、`permission_capacity_exceeded`、`capacity_overcommitted`；0B 测试注入测量能力已实现，Q/P/N 由 0C 用户批准；生产 admission 在批准前 fail-closed。
 - reset-context：Slot `context_generation` + 唯一 reset intent + claim generation fence；错误 `reset_conflict`、`reset_recovery_required`。
-- SQLite 目标迁移版本 v9；迁移、回填规则、备份/回滚见 ADR 第 8 节。
+- Mailbox（`docs/modules/mailbox.md`）：仅现有单 Task handoff、按 Session + 目标 Slot 隔离；`GET /api/sessions/:sessionId/mailbox`、`GET /api/sessions/:sessionId/mailbox/:messageId`、`POST /api/sessions/:sessionId/mailbox/:messageId/read` 已实现，摘要不含正文、`limit` 默认 50/最大 100、keyset 游标、状态仅 unread/read；错误码 `mailbox_message_unavailable`（404）。首次 mark-read 与 metadata-only `message.read` Event 同事务，EventBus 在提交后 best-effort 发布。多 Task handoff、`source_task_id` 仍未实现。
+- SQLite Workspace 根路径 migration v9 已实现；inline Artifact 使用 migration v10；Mailbox read marker 使用 migration v11；Workflow/Task/reset 与文件 Artifact schema 仍使用未来独立 migration。迁移规则见 ADR 第 8 节。

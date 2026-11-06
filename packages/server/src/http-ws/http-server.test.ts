@@ -18,10 +18,13 @@ import type {
   AgentRuntimePort,
   AgentRuntimeSession,
 } from '../application/ports/agent-runtime-port.js'
+import { ArtifactService } from '../application/artifacts/artifact-service.js'
 import { ConversationService } from '../application/conversation/conversation-service.js'
 import { CredentialService } from '../application/credentials/credential-service.js'
+import { MailboxService } from '../application/mailbox/mailbox-service.js'
 import { PermissionScheduler } from '../application/permission/permission-scheduler.js'
 import type { CredentialStorePort } from '../application/ports/credential-store-port.js'
+import type { WorkspaceRootPathPort } from '../application/ports/workspace-root-path-port.js'
 import {
   CredentialDeniedError,
   CredentialIdempotencyConflictError,
@@ -43,6 +46,8 @@ import { InProcessEventBus } from '../infrastructure/events/in-process-event-bus
 import { JsonRoleConfigRepository } from '../infrastructure/config/json-role-config-repository.js'
 import { JsonWorkspaceConfig } from '../infrastructure/config/json-workspace-config.js'
 import { SqliteDatabase } from '../infrastructure/persistence/sqlite-database.js'
+import { SqliteArtifactStore } from '../infrastructure/persistence/sqlite-artifact-store.js'
+import { SqliteMailboxStore } from '../infrastructure/persistence/sqlite-mailbox-store.js'
 import { SqliteRepository } from '../infrastructure/persistence/sqlite-repository.js'
 import { createHttpApp } from './http-server.js'
 import { LocalTokenService } from './local-token.js'
@@ -191,15 +196,20 @@ async function createTestApp(
   configImportRoot?: string,
   runtimeError?: Error,
   credentialStore: CredentialStorePort = new TestCredentialStore(),
+  rootPathPort: WorkspaceRootPathPort = {
+    resolveExistingDirectory: async (path: string): Promise<string> => path,
+  },
 ): Promise<{
   app: Awaited<ReturnType<typeof createHttpApp>>
   token: LocalTokenService
   repository: SqliteRepository
+  database: SqliteDatabase
   conversationService: ConversationService
   credentialStore: CredentialStorePort
   runtime: TestRuntime
 }> {
-  const repository = new SqliteRepository(new SqliteDatabase(':memory:'))
+  const database = new SqliteDatabase(':memory:')
+  const repository = new SqliteRepository(database)
   const ids = new TestIds()
   const runtime = new TestRuntime(runtimeError)
   const environment = {
@@ -210,7 +220,7 @@ async function createTestApp(
   const definitions = {
     get: () => ({ adapterCommand: 'test-adapter', adapterArgs: [], adapterVersion: 'test' }),
   }
-  const workspaceService = new WorkspaceService(repository, ids, systemClock)
+  const workspaceService = new WorkspaceService(repository, ids, systemClock, rootPathPort)
   const roleConfigRepository = new JsonRoleConfigRepository(
     new JsonWorkspaceConfig(join(tmpdir(), `rolecast-http-${randomUUID()}`)),
   )
@@ -228,6 +238,7 @@ async function createTestApp(
   const sessionService = new SessionService(repository, runtime, ids, systemClock, definitions, environment, roleService)
   const eventBus = new InProcessEventBus()
   const permissionScheduler = new PermissionScheduler(repository, runtime, systemClock)
+  const redactor = new SecretRedactor()
   const conversationService = new ConversationService(
     repository,
     runtime,
@@ -236,10 +247,21 @@ async function createTestApp(
     systemClock,
     eventBus,
     permissionScheduler,
-    new SecretRedactor(),
+    redactor,
+  )
+  const artifactService = new ArtifactService(
+    repository,
+    new SqliteArtifactStore(database),
+    rootPathPort,
+    redactor,
+    ids,
+    systemClock,
+    eventBus,
   )
   const token = new LocalTokenService('test-local-token')
   const app = await createHttpApp({
+    artifactService,
+    mailboxService: new MailboxService(new SqliteMailboxStore(database), ids, systemClock, eventBus),
     workspaceService,
     providerService,
     credentialService: new CredentialService(credentialStore),
@@ -250,10 +272,169 @@ async function createTestApp(
     eventBus,
     localToken: token,
   })
-  return { app, token, repository, conversationService, credentialStore, runtime }
+  return { app, token, repository, database, conversationService, credentialStore, runtime }
 }
 
 describe('HTTP 控制面', () => {
+  it('Artifact 创建路由拒绝缺字段请求并返回统一校验错误', async () => {
+    const { app, token, repository } = await createTestApp()
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/sessions/session-1/artifacts',
+      headers: { authorization: `Bearer ${token.value()}` },
+      payload: {},
+    })
+
+    expect(response.statusCode).toBe(400)
+    expect(response.json()).toMatchObject({ ok: false, error: { code: 'invalid_request' } })
+    await app.close()
+    await repository.close()
+  })
+
+  it('Artifact 跨 Session metadata/content 读取统一隐藏为 artifact_unavailable', async () => {
+    const { app, token, repository } = await createTestApp()
+    const headers = { authorization: `Bearer ${token.value()}` }
+    const metadata = await app.inject({
+      method: 'GET',
+      url: '/api/sessions/other-session/artifacts/artifact-1',
+      headers,
+    })
+    const content = await app.inject({
+      method: 'GET',
+      url: '/api/sessions/other-session/artifacts/artifact-1/content',
+      headers,
+    })
+
+    expect(metadata.statusCode).toBe(404)
+    expect(metadata.json()).toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } })
+    expect(content.statusCode).toBe(404)
+    expect(content.json()).toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } })
+    await app.close()
+    await repository.close()
+  })
+
+  it('创建 inline Artifact、分离读取正文并幂等重放', async () => {
+    const { app, token, repository, database, conversationService } = await createTestApp()
+    const headers = { authorization: `Bearer ${token.value()}` }
+    const workspace = await app.inject({
+      method: 'POST',
+      url: '/api/workspaces',
+      headers,
+      payload: { name: 'Artifact HTTP 测试', root_path: '/tmp/rolecast-artifact-http-root' },
+    })
+    const workspaceId = workspace.json().data.id as string
+    const provider = await app.inject({
+      method: 'POST',
+      url: `/api/workspaces/${workspaceId}/providers`,
+      headers,
+      payload: { provider_kind: 'claude', connection_kind: 'local', environment_mode: 'inherited' },
+    })
+    const providerId = provider.json().data.id as string
+    await app.inject({ method: 'POST', url: `/api/providers/${providerId}/discover`, headers })
+    const session = await app.inject({
+      method: 'POST',
+      url: `/api/workspaces/${workspaceId}/sessions`,
+      headers,
+      payload: { name: 'Artifact 来源', provider_connection_id: providerId, model_id: 'test-model' },
+    })
+    const sessionId = session.json().data.session.id as string
+    const message = await app.inject({
+      method: 'POST',
+      url: `/api/sessions/${sessionId}/messages`,
+      headers,
+      payload: { content: '请生成 Artifact 来源文本' },
+    })
+    const runId = message.json().data.run.id as string
+    await conversationService.waitForTurn(runId)
+
+    const createPayload = { source_run_id: runId, request_id: 'artifact-http-create-001' }
+    const created = await app.inject({
+      method: 'POST',
+      url: `/api/sessions/${sessionId}/artifacts`,
+      headers,
+      payload: createPayload,
+    })
+    expect(created.statusCode).toBe(201)
+    const artifact = created.json().data as { id: string; size_bytes: number; sha256: string }
+    expect(artifact).toMatchObject({ size_bytes: 6 })
+    expect(artifact.sha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(created.json().data).not.toHaveProperty('content')
+    expect(created.json().data).not.toHaveProperty('content_ref')
+
+    const metadata = await app.inject({
+      method: 'GET',
+      url: `/api/sessions/${sessionId}/artifacts/${artifact.id}`,
+      headers,
+    })
+    const content = await app.inject({
+      method: 'GET',
+      url: `/api/sessions/${sessionId}/artifacts/${artifact.id}/content`,
+      headers,
+    })
+    expect(metadata.json().data.id).toBe(artifact.id)
+    expect(metadata.json().data).not.toHaveProperty('content')
+    expect(content.json().data).toMatchObject({ artifact_id: artifact.id, content: '收到' })
+
+    const listed = await app.inject({
+      method: 'GET',
+      url: `/api/sessions/${sessionId}/artifacts?limit=1`,
+      headers,
+    })
+    expect(listed.statusCode).toBe(200)
+    expect(listed.json().data).toMatchObject({ items: [{ id: artifact.id }], next_cursor: null })
+    expect(listed.json().data.items[0]).not.toHaveProperty('content')
+    const invalidCursor = await app.inject({
+      method: 'GET',
+      url: `/api/sessions/${sessionId}/artifacts?cursor=not-an-artifact`,
+      headers,
+    })
+    expect(invalidCursor.statusCode).toBe(404)
+    expect(invalidCursor.json()).toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } })
+    const missingSession = await app.inject({
+      method: 'GET',
+      url: '/api/sessions/missing-session/artifacts',
+      headers,
+    })
+    expect(missingSession.statusCode).toBe(404)
+    expect(missingSession.json()).toMatchObject({ ok: false, error: { code: 'not_found' } })
+    const invalidLimit = await app.inject({
+      method: 'GET',
+      url: `/api/sessions/${sessionId}/artifacts?limit=101`,
+      headers,
+    })
+    expect(invalidLimit.statusCode).toBe(400)
+    expect(invalidLimit.json()).toMatchObject({ ok: false, error: { code: 'invalid_request' } })
+
+    const replay = await app.inject({
+      method: 'POST',
+      url: `/api/sessions/${sessionId}/artifacts`,
+      headers,
+      payload: createPayload,
+    })
+    expect(replay.statusCode).toBe(201)
+    expect(replay.json().data.id).toBe(artifact.id)
+    const otherSession = await app.inject({
+      method: 'POST',
+      url: `/api/workspaces/${workspaceId}/sessions`,
+      headers,
+      payload: { name: '其他 Artifact Session', provider_connection_id: providerId, model_id: 'test-model' },
+    })
+    const hiddenContent = await app.inject({
+      method: 'GET',
+      url: `/api/sessions/${otherSession.json().data.session.id}/artifacts/${artifact.id}/content`,
+      headers,
+    })
+    expect(hiddenContent.statusCode).toBe(404)
+    expect(hiddenContent.json()).toMatchObject({ ok: false, error: { code: 'artifact_unavailable' } })
+
+    const artifactCount = database.prepare('SELECT COUNT(*) AS count FROM artifacts').get() as { count: number }
+    const events = await repository.replayEvents(runId, 0)
+    expect(artifactCount.count).toBe(1)
+    expect(events.filter((event) => event.type === 'artifact.created')).toHaveLength(1)
+    await app.close()
+    await repository.close()
+  })
+
   it('健康检查无需 Token，REST 其他接口必须认证', async () => {
     const { app, token, repository } = await createTestApp()
     await expect(app.inject({ method: 'GET', url: '/healthz' })).resolves.toMatchObject({ statusCode: 200 })
@@ -288,6 +469,239 @@ describe('HTTP 控制面', () => {
     await repository.close()
   })
 
+  it('新建 Workspace 缺少 root_path 时返回稳定 422 且不写入', async () => {
+    const { app, token, repository } = await createTestApp()
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/workspaces',
+      headers: { authorization: `Bearer ${token.value()}` },
+      payload: { name: '缺少根路径' },
+    })
+
+    expect(response.statusCode).toBe(422)
+    expect(response.json()).toMatchObject({ ok: false, error: { code: 'workspace_root_required' } })
+    await expect(repository.listWorkspaces()).resolves.toHaveLength(0)
+    await app.close()
+    await repository.close()
+  })
+
+  it('新建 Workspace 显式提交空字符串根路径时返回 422 workspace_root_invalid 且不写入', async () => {
+    const { app, token, repository } = await createTestApp()
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/workspaces',
+      headers: { authorization: `Bearer ${token.value()}` },
+      payload: { name: '空根路径', root_path: '' },
+    })
+
+    expect(response.statusCode).toBe(422)
+    expect(response.json()).toMatchObject({ ok: false, error: { code: 'workspace_root_invalid' } })
+    await expect(repository.listWorkspaces()).resolves.toHaveLength(0)
+    await app.close()
+    await repository.close()
+  })
+
+  it('创建 Workspace 后读取独立 canonical root-path DTO，并拒绝重复路径', async () => {
+    const { app, token, repository } = await createTestApp()
+    const headers = { authorization: `Bearer ${token.value()}` }
+    const rootPath = '/tmp/rolecast-http-root-path'
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/workspaces',
+      headers,
+      payload: { name: '配置根路径', root_path: rootPath },
+    })
+    const workspaceId = created.json().data.id as string
+
+    const rootPathResponse = await app.inject({
+      method: 'GET',
+      url: `/api/workspaces/${workspaceId}/root-path`,
+      headers,
+    })
+    expect(rootPathResponse.statusCode).toBe(200)
+    expect(rootPathResponse.json()).toMatchObject({
+      ok: true,
+      data: { workspace_id: workspaceId, root_path: rootPath },
+    })
+
+    const duplicate = await app.inject({
+      method: 'POST',
+      url: '/api/workspaces',
+      headers,
+      payload: { name: '重复根路径', root_path: rootPath },
+    })
+    expect(duplicate.statusCode).toBe(409)
+    expect(duplicate.json()).toMatchObject({ ok: false, error: { code: 'workspace_root_duplicate' } })
+    expect(duplicate.body).not.toContain(rootPath)
+    await expect(repository.listWorkspaces()).resolves.toHaveLength(1)
+    await app.close()
+    await repository.close()
+  })
+
+  it('旧 Workspace GET 返回 null，且 root-path 只能补设一次', async () => {
+    const { app, token, repository } = await createTestApp()
+    const headers = { authorization: `Bearer ${token.value()}` }
+    const workspaceId = 'legacy-workspace'
+    await repository.createWorkspace({
+      id: workspaceId,
+      name: '旧 Workspace',
+      created_at: '2026-11-04T00:00:00.000Z',
+      updated_at: '2026-11-04T00:00:00.000Z',
+    })
+
+    const initial = await app.inject({
+      method: 'GET',
+      url: `/api/workspaces/${workspaceId}/root-path`,
+      headers,
+    })
+    expect(initial.statusCode).toBe(200)
+    expect(initial.json()).toMatchObject({ ok: true, data: { workspace_id: workspaceId, root_path: null } })
+
+    const configuredPath = '/tmp/rolecast-legacy-root-path'
+    const configured = await app.inject({
+      method: 'POST',
+      url: `/api/workspaces/${workspaceId}/root-path`,
+      headers,
+      payload: { root_path: configuredPath },
+    })
+    expect(configured.statusCode).toBe(200)
+    expect(configured.json()).toMatchObject({
+      ok: true,
+      data: { workspace_id: workspaceId, root_path: configuredPath },
+    })
+
+    const overwrite = await app.inject({
+      method: 'POST',
+      url: `/api/workspaces/${workspaceId}/root-path`,
+      headers,
+      payload: { root_path: '/tmp/rolecast-forbidden-overwrite' },
+    })
+    expect(overwrite.statusCode).toBe(409)
+    expect(overwrite.json()).toMatchObject({
+      ok: false,
+      error: { code: 'workspace_root_already_configured' },
+    })
+    const finalState = await app.inject({
+      method: 'GET',
+      url: `/api/workspaces/${workspaceId}/root-path`,
+      headers,
+    })
+    expect(finalState.json().data.root_path).toBe(configuredPath)
+    await app.close()
+    await repository.close()
+  })
+
+  it('补设显式空字符串根路径时返回 422 workspace_root_invalid 且保持未配置', async () => {
+    const { app, token, repository } = await createTestApp()
+    const headers = { authorization: `Bearer ${token.value()}` }
+    const workspaceId = 'legacy-workspace'
+    await repository.createWorkspace({
+      id: workspaceId,
+      name: '旧 Workspace',
+      created_at: '2026-11-04T00:00:00.000Z',
+      updated_at: '2026-11-04T00:00:00.000Z',
+    })
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/workspaces/${workspaceId}/root-path`,
+      headers,
+      payload: { root_path: '' },
+    })
+    expect(response.statusCode).toBe(422)
+    expect(response.json()).toMatchObject({ ok: false, error: { code: 'workspace_root_invalid' } })
+
+    const state = await app.inject({
+      method: 'GET',
+      url: `/api/workspaces/${workspaceId}/root-path`,
+      headers,
+    })
+    expect(state.json()).toMatchObject({ ok: true, data: { workspace_id: workspaceId, root_path: null } })
+    await app.close()
+    await repository.close()
+  })
+
+  it('未知 Workspace 的 root-path GET 和 POST 返回 404 且不写入', async () => {
+    const { app, token, repository } = await createTestApp()
+    const headers = { authorization: `Bearer ${token.value()}` }
+    const getResponse = await app.inject({
+      method: 'GET',
+      url: '/api/workspaces/missing-workspace/root-path',
+      headers,
+    })
+    const postResponse = await app.inject({
+      method: 'POST',
+      url: '/api/workspaces/missing-workspace/root-path',
+      headers,
+      payload: { root_path: '/tmp/rolecast-missing-workspace-root' },
+    })
+
+    expect(getResponse.statusCode).toBe(404)
+    expect(getResponse.json()).toMatchObject({ ok: false, error: { code: 'not_found' } })
+    expect(postResponse.statusCode).toBe(404)
+    expect(postResponse.json()).toMatchObject({ ok: false, error: { code: 'not_found' } })
+    await expect(repository.listWorkspaces()).resolves.toHaveLength(0)
+    await app.close()
+    await repository.close()
+  })
+
+  it('root-path 路由继续要求有效 Local Token', async () => {
+    const { app, repository } = await createTestApp()
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/workspaces/legacy-workspace/root-path',
+    })
+
+    expect(response.statusCode).toBe(401)
+    expect(response.json()).toMatchObject({ ok: false, error: { code: 'unauthorized' } })
+    await app.close()
+    await repository.close()
+  })
+
+  it('root-path 写入仍受 Host/Origin 保护', async () => {
+    const { app, token, repository } = await createTestApp()
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/workspaces/legacy-workspace/root-path',
+      headers: {
+        host: 'evil.example.test',
+        origin: 'https://evil.example.test',
+        authorization: `Bearer ${token.value()}`,
+      },
+      payload: { root_path: '/tmp/rolecast-forbidden-root' },
+    })
+
+    expect(response.statusCode).toBe(403)
+    expect(response.json()).toMatchObject({ ok: false, error: { code: 'unauthorized' } })
+    await expect(repository.listWorkspaces()).resolves.toHaveLength(0)
+    await app.close()
+    await repository.close()
+  })
+
+  it('根路径验证失败映射为稳定 422，且不回显路径或部分写入', async () => {
+    const rootPathPort: WorkspaceRootPathPort = {
+      resolveExistingDirectory: async () => {
+        throw new Error('private filesystem detail')
+      },
+    }
+    const { app, token, repository } = await createTestApp(undefined, undefined, undefined, undefined, rootPathPort)
+    const inputPath = '/private/user/path-do-not-echo'
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/workspaces',
+      headers: { authorization: `Bearer ${token.value()}` },
+      payload: { name: '无效根路径', root_path: inputPath },
+    })
+
+    expect(response.statusCode).toBe(422)
+    expect(response.json()).toMatchObject({ ok: false, error: { code: 'workspace_root_invalid' } })
+    expect(response.body).not.toContain(inputPath)
+    expect(response.body).not.toContain('private filesystem detail')
+    await expect(repository.listWorkspaces()).resolves.toHaveLength(0)
+    await app.close()
+    await repository.close()
+  })
+
   it('PATCH Provider 只接受非秘密字段并返回更新后的连接', async () => {
     const { app, token, repository } = await createTestApp()
     const headers = { authorization: `Bearer ${token.value()}` }
@@ -295,7 +709,7 @@ describe('HTTP 控制面', () => {
       method: 'POST',
       url: '/api/workspaces',
       headers,
-      payload: { name: '更新工作区' },
+      payload: { name: '更新工作区', root_path: '/tmp/rolecast-http-test-root' },
     })
     const workspaceId = workspaceResponse.json().data.id as string
     const providerResponse = await app.inject({
@@ -334,7 +748,7 @@ describe('HTTP 控制面', () => {
     const { app, token, repository } = await createTestApp()
     const headers = { authorization: `Bearer ${token.value()}` }
     const workspaceId = (await app.inject({
-      method: 'POST', url: '/api/workspaces', headers, payload: { name: '清除 URL 工作区' },
+      method: 'POST', url: '/api/workspaces', headers, payload: { name: '清除 URL 工作区', root_path: '/tmp/rolecast-http-test-root' },
     })).json().data.id as string
     const providerId = (await app.inject({
       method: 'POST',
@@ -371,7 +785,7 @@ describe('HTTP 控制面', () => {
     const { app, token, repository } = await createTestApp()
     const headers = { authorization: `Bearer ${token.value()}` }
     const workspaceId = (await app.inject({
-      method: 'POST', url: '/api/workspaces', headers, payload: { name: '清除引用工作区' },
+      method: 'POST', url: '/api/workspaces', headers, payload: { name: '清除引用工作区', root_path: '/tmp/rolecast-http-test-root' },
     })).json().data.id as string
     // 直接落一条 isolated api_key 记录（引用为合成值，非真实凭据）。
     const created = await repository.createProviderConnection({
@@ -412,7 +826,7 @@ describe('HTTP 控制面', () => {
       method: 'POST',
       url: '/api/workspaces',
       headers,
-      payload: { name: '更新拒绝工作区' },
+      payload: { name: '更新拒绝工作区', root_path: '/tmp/rolecast-http-test-root' },
     })
     const workspaceId = workspaceResponse.json().data.id as string
     const providerResponse = await app.inject({
@@ -477,7 +891,7 @@ describe('HTTP 控制面', () => {
       method: 'POST',
       url: '/api/workspaces',
       headers,
-      payload: { name: '错误映射测试' },
+      payload: { name: '错误映射测试', root_path: '/tmp/rolecast-http-test-root' },
     })
     const workspaceId = workspaceResponse.json().data.id as string
     const providerResponse = await app.inject({
@@ -515,7 +929,7 @@ describe('HTTP 控制面', () => {
       method: 'POST',
       url: '/api/workspaces',
       headers,
-      payload: { name: '未证组合工作区' },
+      payload: { name: '未证组合工作区', root_path: '/tmp/rolecast-http-test-root' },
     })
     const workspaceId = workspaceResponse.json().data.id as string
     const providerResponse = await app.inject({
@@ -554,7 +968,7 @@ describe('HTTP 控制面', () => {
       method: 'POST',
       url: '/api/workspaces',
       headers,
-      payload: { name: '缺 URL 工作区' },
+      payload: { name: '缺 URL 工作区', root_path: '/tmp/rolecast-http-test-root' },
     })
     const workspaceId = workspaceResponse.json().data.id as string
     const response = await app.inject({
@@ -582,7 +996,7 @@ describe('HTTP 控制面', () => {
       method: 'POST',
       url: '/api/workspaces',
       headers,
-      payload: { name: '凭据拒绝映射测试' },
+      payload: { name: '凭据拒绝映射测试', root_path: '/tmp/rolecast-http-test-root' },
     })
     const workspaceId = workspaceResponse.json().data.id as string
     const providerResponse = await app.inject({
@@ -618,7 +1032,7 @@ describe('HTTP 控制面', () => {
       method: 'POST',
       url: '/api/workspaces',
       headers,
-      payload: { name: '测试工作区' },
+      payload: { name: '测试工作区', root_path: '/tmp/rolecast-http-test-root' },
     })
     expect(workspaceResponse.statusCode).toBe(201)
     const workspaceId = workspaceResponse.json().data.id as string
@@ -672,7 +1086,7 @@ describe('HTTP 控制面', () => {
     const { app, token, repository } = await createTestApp()
     const headers = { authorization: `Bearer ${token.value()}` }
     const workspaceResponse = await app.inject({
-      method: 'POST', url: '/api/workspaces', headers, payload: { name: '绑定初始 Slot' },
+      method: 'POST', url: '/api/workspaces', headers, payload: { name: '绑定初始 Slot', root_path: '/tmp/rolecast-http-test-root' },
     })
     const workspaceId = workspaceResponse.json().data.id as string
     const providerResponse = await app.inject({
@@ -743,7 +1157,7 @@ describe('HTTP 控制面', () => {
       method: 'POST',
       url: '/api/workspaces',
       headers,
-      payload: { name: '多 Slot 测试' },
+      payload: { name: '多 Slot 测试', root_path: '/tmp/rolecast-http-test-root' },
     })
     const workspaceId = workspaceResponse.json().data.id as string
     const providerResponse = await app.inject({
@@ -914,7 +1328,7 @@ describe('HTTP 控制面', () => {
       method: 'POST',
       url: '/api/workspaces',
       headers,
-      payload: { name: 'Role 配置测试' },
+      payload: { name: 'Role 配置测试', root_path: '/tmp/rolecast-http-test-root' },
     })
     const workspaceId = workspaceResponse.json().data.id as string
     const providerResponse = await app.inject({
@@ -1002,7 +1416,7 @@ describe('HTTP 控制面', () => {
         method: 'POST',
         url: '/api/workspaces',
         headers,
-        payload: { name: 'Codex 导入测试' },
+        payload: { name: 'Codex 导入测试', root_path: '/tmp/rolecast-http-test-root' },
       })
       const workspaceId = workspaceResponse.json().data.id as string
       const providerResponse = await app.inject({
@@ -1343,4 +1757,121 @@ describe('HTTP 控制面', () => {
     await app.close()
     await repository.close()
   })
+
+  it('Mailbox 列表、详情与显式已读经 HTTP 保持 Session+Slot 隔离', async () => {
+    const { app, token, repository, database } = await createTestApp()
+    seedMailboxRows(database)
+    const headers = { authorization: `Bearer ${token.value()}` }
+
+    const list = await app.inject({
+      method: 'GET', url: '/api/sessions/session-1/mailbox?slot_id=slot-1', headers,
+    })
+    expect(list.statusCode).toBe(200)
+    expect(list.json().data.items).toEqual([{
+      id: 'message-1',
+      session_id: 'session-1',
+      sender_id: 'slot-sender',
+      to_slot_id: 'slot-1',
+      created_at: '2026-11-05T09:00:00.000Z',
+      status: 'unread',
+      read_at: null,
+    }])
+    expect(list.json().data.items[0]).not.toHaveProperty('content')
+
+    const detail = await app.inject({
+      method: 'GET', url: '/api/sessions/session-1/mailbox/message-1?slot_id=slot-1', headers,
+    })
+    expect(detail.statusCode).toBe(200)
+    expect(detail.json().data).toMatchObject({
+      status: 'unread',
+      message: { id: 'message-1', content: 'handoff body', kind: 'handoff', to_slot_id: 'slot-1' },
+    })
+
+    const read = await app.inject({
+      method: 'POST', url: '/api/sessions/session-1/mailbox/message-1/read', headers, payload: { slot_id: 'slot-1' },
+    })
+    expect(read.statusCode).toBe(200)
+    expect(read.json().data).toMatchObject({ message_id: 'message-1', status: 'read', event_bus_status: 'published' })
+
+    const after = await app.inject({
+      method: 'GET', url: '/api/sessions/session-1/mailbox?slot_id=slot-1', headers,
+    })
+    expect(after.json().data.items[0]).toMatchObject({ status: 'read' })
+    await app.close()
+    await repository.close()
+  })
+
+  it('Mailbox 越权、未知 Slot 与非法分页统一拒绝且不泄露正文', async () => {
+    const { app, token, repository, database } = await createTestApp()
+    seedMailboxRows(database)
+    const headers = { authorization: `Bearer ${token.value()}` }
+
+    const otherSlot = await app.inject({
+      method: 'GET', url: '/api/sessions/session-1/mailbox?slot_id=slot-missing', headers,
+    })
+    expect(otherSlot.statusCode).toBe(404)
+    expect(otherSlot.json()).toMatchObject({ ok: false, error: { code: 'mailbox_message_unavailable' } })
+    expect(otherSlot.body).not.toContain('handoff body')
+
+    const missingMessage = await app.inject({
+      method: 'GET', url: '/api/sessions/session-1/mailbox/missing-message?slot_id=slot-1', headers,
+    })
+    expect(missingMessage.statusCode).toBe(404)
+    expect(missingMessage.json()).toMatchObject({ ok: false, error: { code: 'mailbox_message_unavailable' } })
+
+    const invalidLimit = await app.inject({
+      method: 'GET', url: '/api/sessions/session-1/mailbox?slot_id=slot-1&limit=0', headers,
+    })
+    expect(invalidLimit.statusCode).toBe(400)
+
+    const invalidCursor = await app.inject({
+      method: 'GET', url: '/api/sessions/session-1/mailbox?slot_id=slot-1&cursor=missing-message', headers,
+    })
+    expect(invalidCursor.statusCode).toBe(404)
+
+    const invalidBody = await app.inject({
+      method: 'POST',
+      url: '/api/sessions/session-1/mailbox/message-1/read',
+      headers,
+      payload: { slot_id: 'slot-1', content: 'leak' },
+    })
+    expect(invalidBody.statusCode).toBe(400)
+
+    const unauthenticated = await app.inject({
+      method: 'GET', url: '/api/sessions/session-1/mailbox?slot_id=slot-1',
+    })
+    expect(unauthenticated.statusCode).toBe(401)
+    await app.close()
+    await repository.close()
+  })
 })
+
+/** 直接写入 Mailbox HTTP 测试所需的最小已完成 Run 与 handoff Message。 */
+function seedMailboxRows(database: SqliteDatabase): void {
+  const timestamp = '2026-11-05T08:00:00.000Z'
+  database.prepare('INSERT INTO workspaces(id, name, created_at, updated_at) VALUES (?, ?, ?, ?)')
+    .run('workspace-1', 'Workspace 1', timestamp, timestamp)
+  database
+    .prepare('INSERT INTO sessions(id, workspace_id, name, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run('session-1', 'workspace-1', 'Session 1', 'active', timestamp, timestamp)
+  for (const slotId of ['slot-1', 'slot-other']) {
+    database
+      .prepare('INSERT INTO agent_slots(id, session_id, model_id, status, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(slotId, 'session-1', 'model-1', 'idle', timestamp)
+  }
+  database
+    .prepare(
+      `INSERT INTO runs(
+        id, workspace_id, session_id, status, attempt, created_at, updated_at,
+        event_sequence, completed_sequence
+      ) VALUES (?, ?, ?, 'completed', 1, ?, ?, 2, 2)`,
+    )
+    .run('run-1', 'workspace-1', 'session-1', timestamp, timestamp)
+  database
+    .prepare(
+      `INSERT INTO messages(
+        id, session_id, run_id, sender_kind, sender_id, content, created_at, kind, to_slot_id
+      ) VALUES (?, ?, ?, 'agent', 'slot-sender', ?, ?, 'handoff', ?)`,
+    )
+    .run('message-1', 'session-1', 'run-1', 'handoff body', '2026-11-05T09:00:00.000Z', 'slot-1')
+}

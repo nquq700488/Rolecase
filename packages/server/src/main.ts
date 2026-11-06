@@ -16,6 +16,11 @@ import { JsonRoleConfigRepository } from './infrastructure/config/json-role-conf
 import { JsonWorkspaceConfig } from './infrastructure/config/json-workspace-config.js'
 import { SqliteDatabase } from './infrastructure/persistence/sqlite-database.js'
 import { SqliteRepository } from './infrastructure/persistence/sqlite-repository.js'
+import { SqliteArtifactStore } from './infrastructure/persistence/sqlite-artifact-store.js'
+import { SqliteMailboxStore } from './infrastructure/persistence/sqlite-mailbox-store.js'
+import { ArtifactService } from './application/artifacts/artifact-service.js'
+import { MailboxService } from './application/mailbox/mailbox-service.js'
+import { NodeWorkspaceRootPathAdapter } from './infrastructure/workspace-root-path-adapter.js'
 import { ConversationService } from './application/conversation/conversation-service.js'
 import { CredentialService } from './application/credentials/credential-service.js'
 import { PermissionScheduler } from './application/permission/permission-scheduler.js'
@@ -123,6 +128,17 @@ export async function buildServer(config: ServerConfig = readServerConfig()): Pr
   const ids: IdGeneratorPort = { next: (prefix) => `${prefix}-${randomUUID()}` }
   const workspaceConfig = new JsonWorkspaceConfig(dirname(config.databasePath))
   const roleConfigRepository = new JsonRoleConfigRepository(workspaceConfig)
+  const workspaceRootPaths = new NodeWorkspaceRootPathAdapter()
+  const artifactService = new ArtifactService(
+    repository,
+    new SqliteArtifactStore(database),
+    workspaceRootPaths,
+    redactor,
+    ids,
+    systemClock,
+    eventBus,
+  )
+  const mailboxService = new MailboxService(new SqliteMailboxStore(database), ids, systemClock, eventBus)
   const roleService = new RoleService(roleConfigRepository, repository, ids, systemClock)
   const definitions: ProviderDefinitionPort = {
     get: (providerKind) => {
@@ -159,7 +175,7 @@ export async function buildServer(config: ServerConfig = readServerConfig()): Pr
     environment: config.environment,
     runtimeDirectory: (connectionId) => resolve(dirname(config.databasePath), `provider-${connectionId}`),
   }
-  const workspaceService = new WorkspaceService(repository, ids, systemClock)
+  const workspaceService = new WorkspaceService(repository, ids, systemClock, workspaceRootPaths)
   const providerService = new ProviderService(
     repository,
     runtime,
@@ -188,6 +204,8 @@ export async function buildServer(config: ServerConfig = readServerConfig()): Pr
   )
   const localToken = new LocalTokenService()
   const app = await createHttpApp({
+    artifactService,
+    mailboxService,
     workspaceService,
     providerService,
     credentialService,

@@ -594,20 +594,67 @@ export function insertRun(database: SqliteDatabase, run: RunDto, chainId = run.i
     .run({ ...runParameters(run), retry_chain_id: chainId })
 }
 
-/** 插入 Task；输入消息只存内部关联。 */
-export function insertTask(database: SqliteDatabase, task: TaskDto, inputMessageId: string | null): void {
+/**
+ * @name insertTask
+ * @description 插入 Task 与私有 lineage；输入消息只存内部关联。
+ * @param database SQLite 数据库
+ * @param task 公共 Task DTO
+ * @param inputMessageId 内部输入消息 ID
+ * @param lineage 私有 lineage，普通单 Agent Task 默认 agent/1
+ * @returns 无返回值
+ */
+export function insertTask(
+  database: SqliteDatabase,
+  task: TaskDto,
+  inputMessageId: string | null,
+  lineage: { nodeKey: string; attempt: number; retryOfTaskId: string | null } = {
+    nodeKey: 'agent',
+    attempt: 1,
+    retryOfTaskId: null,
+  },
+): void {
   database
     .prepare(
       `INSERT INTO tasks(
         id, workspace_id, session_id, run_id, slot_id, title, status,
-        input_message_id, created_at, updated_at
+        input_message_id, node_key, attempt, retry_of_task_id, created_at, updated_at
       ) VALUES (@id, @workspace_id, @session_id, @run_id, @slot_id, @title, @status,
-        @input_message_id, @created_at, @updated_at)`,
+        @input_message_id, @node_key, @lineage_attempt, @retry_of_task_id, @created_at, @updated_at)`,
     )
     .run({
       ...task,
       input_message_id: inputMessageId,
+      node_key: lineage.nodeKey,
+      lineage_attempt: lineage.attempt,
+      retry_of_task_id: lineage.retryOfTaskId,
     })
+}
+
+/**
+ * @name saveTaskWithDefaultLineage
+ * @description 写入 Task 并补充私有 lineage。公共 TaskDto 不携带节点身份，
+ *   只有 Run 内首个 Task 采用单 Agent 默认 lineage（agent/1）；后续 Task 写 NULL 表示未知，
+ *   避免与 (run_id, node_key, attempt) 唯一索引冲突。更新已有 Task 时保留原 lineage。
+ * @param database SQLite 数据库
+ * @param task 公共 Task DTO
+ * @returns 无返回值
+ */
+export function saveTaskWithDefaultLineage(database: SqliteDatabase, task: TaskDto): void {
+  database
+    .prepare(
+      `INSERT INTO tasks(
+        id, workspace_id, session_id, run_id, slot_id, title, status,
+        node_key, attempt, retry_of_task_id, created_at, updated_at
+      ) VALUES (@id, @workspace_id, @session_id, @run_id, @slot_id, @title, @status,
+        CASE WHEN EXISTS(SELECT 1 FROM tasks WHERE run_id = @run_id) THEN NULL ELSE 'agent' END,
+        CASE WHEN EXISTS(SELECT 1 FROM tasks WHERE run_id = @run_id) THEN NULL ELSE 1 END,
+        NULL, @created_at, @updated_at)
+      ON CONFLICT(id) DO UPDATE SET
+        title = excluded.title,
+        status = excluded.status,
+        updated_at = excluded.updated_at`,
+    )
+    .run(task)
 }
 
 /** 插入用户/Agent Message。 */

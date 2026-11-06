@@ -21,7 +21,7 @@
 - Workspace、Provider、Role、Binding、Session、Workflow CRUD；Role/Binding 支持单资源 GET、列表、创建、PATCH 和删除；
 - Credential 创建（只写入，不提供读取、列表、轮换或删除）；
 - Run 启动、取消、恢复、重试；
-- Message、Permission、Artifact 查询；
+- Message、Permission、Artifact metadata/content 查询及受限创建；
 - WebSocket 事件订阅；
 - 统一错误响应；
 - Local Token 和 Origin/Host 校验。
@@ -54,6 +54,35 @@ DELETE /api/bindings/:bindingId
 ```
 
 列表和创建使用路径中的 Workspace ID；单资源读取和变更由 Application 校验归属。REST 当前是本地单用户控制面，不提供独立的 Workspace ACL；跨 Workspace 的扁平 ID 访问统一返回资源不存在，不泄露资源存在性。
+
+## Workspace 根路径
+
+```text
+POST /api/workspaces
+GET  /api/workspaces/:workspaceId/root-path
+POST /api/workspaces/:workspaceId/root-path
+```
+
+- 创建请求严格接受 `{ name, root_path }`，缺少 `root_path` 返回 422 `workspace_root_required`；路径经 Application 的 filesystem Port 校验并保存 canonical 路径。成功仍返回原有 `WorkspaceDto`，不增加 `root_path` 字段。
+- 根路径状态单独使用严格 `WorkspaceRootPathDto { workspace_id, root_path }`；迁移后的旧 Workspace 在补设前返回 `root_path: null`。
+- 一次性补设仅允许 NULL → canonical path；无效路径返回 422 `workspace_root_invalid`，其他 Workspace 已占用该 canonical 路径返回 409 `workspace_root_duplicate`，重复补设返回 409 `workspace_root_already_configured`。未知 Workspace 返回 404 `not_found`。
+- 两条 root-path 路由与 Workspace 创建一样经过 Local Token、Host、Origin 检查。控制器只校验 Contract 并调用 WorkspaceService；不直接访问数据库、创建目录或读取根目录内容。错误响应不回显原始路径。
+- 旧客户端仍可读取既有 WorkspaceDto，但旧格式 `{ name }` 不再满足创建 Contract；创建 Workspace 前需升级客户端并提供根路径。
+
+## Artifact 路由（inline 切片）
+
+路由由独立的 `http-ws/artifact-routes.ts` 注册；复用本模块安全 hooks 与统一错误映射，不在控制器中访问 SQLite。
+
+```text
+POST /api/sessions/:sessionId/artifacts
+GET  /api/sessions/:sessionId/artifacts?limit=&cursor=
+GET  /api/sessions/:sessionId/artifacts/:artifactId
+GET  /api/sessions/:sessionId/artifacts/:artifactId/content
+```
+
+列表路由以严格 query 接受可选 `limit`（默认 50，最大 100）与 keyset `cursor`，返回仅含 metadata 的有界页；按 `created_at DESC, id DESC` 稳定分页，正文列不进入查询。创建请求严格为 `{ source_run_id, request_id }`；成功返回 metadata-only DTO。来源必须是该 Session 的 completed Run 且恰有一个 completed Task；服务端只取 `completed_sequence` 内完整持久化 Agent 文本。inline UTF-8 上限为 65,536 bytes，超限为 413 `artifact_too_large`，不转文件。单条 metadata 与内容通过独立 GET 返回；内容路由校验 BLOB 长度和 SHA-256。不存在与跨 Session、完整性错误统一为 404 `artifact_unavailable`。
+
+Artifact 稳定 HTTP 映射固定为：`invalid_request` 400、`source_history_unavailable` 409、`artifact_too_large` 413、`workspace_root_unconfigured` 409、`workspace_root_unavailable` 409、`artifact_request_conflict` 409、`artifact_unavailable` 404、`artifact_sanitization_failed` 500。来源零 Task、恰有一个未完成 Task、多 Task、归属不符或历史缺口均不得写入 Artifact/Event。创建前只复核 Workspace root path；inline 不对目录内容执行文件操作。上述四条路由均经过 Local Token、Host、Origin 安全 hooks。
 
 ## Session 创建
 
@@ -200,6 +229,6 @@ HTTP Framework 可替换，只需保持 REST/WS Contract、错误码和鉴权行
 
 `POST /api/sessions/:sessionId/handoffs` 接受 `{ source_run_id, target_slot_id, request_id }`，返回 `201` 与持久化的 MessageDto；重放返回同一条 Message。`409 source_history_unavailable` 表示来源 Run 无完整可信水位，`413 source_event_payload_too_large` 表示单条/页事件超限，`413 handoff_content_too_large` 表示正文超过 64 KiB；同 key 参数冲突返回 `409 state_conflict`。
 
-## Web Phase 2/3 目标路由（未实现）
+## Web Phase 2/3 路由状态
 
-目标态：Workspace 创建要求 `root_path`，新增 `GET/POST /api/workspaces/:workspaceId/root-path`；handoff 接受可选 `source_task_id`；新增 Artifact、TaskBoard/Task retry、Mailbox、Workflow、capacity 与 reset 路由。错误映射见 `Stage0-Web-Phase2-3-ADR.md`（root/path、source_task、容量、reset）。当前 HTTP 面未包含这些路由。
+Workspace 创建与一次性 root-path 补设、SQLite inline Artifact 创建、分页列表、单条 metadata 与 content 四条路由均已实现（见上文）。Mailbox 三条路由已实现：`GET /api/sessions/:sessionId/mailbox`（`slot_id` 必填，`limit` 默认 50/最大 100，可选 `cursor`）、`GET /api/sessions/:sessionId/mailbox/:messageId?slot_id=...`、`POST /api/sessions/:sessionId/mailbox/:messageId/read`；不可见目标统一返回 `404 mailbox_message_unavailable`，非法 limit/cursor/body 返回统一校验错误。其余目标仍包括 handoff 的可选 `source_task_id`、TaskBoard/Task retry、Workflow、capacity 与 reset 路由。相关错误映射见 `Stage0-Web-Phase2-3-ADR.md`（source_task、容量、reset）。

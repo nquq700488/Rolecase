@@ -10,7 +10,8 @@
 JSON       → 用户配置、Workspace Role / RoleBinding
 SQLite     → Workspace、ProviderConnection（含非秘密 Codex 配置和 config_revision）、ModelCatalog、Session、AgentSlot、Run、Task、Message、ContextSource、Event、Artifact 索引及 Slot 私有 Role source snapshot
 Keychain   → 秘密
-文件系统    → 大型 Artifact 内容
+SQLite BLOB → 本切片的 inline Artifact 文本（≤65,536 UTF-8 bytes）
+文件系统    → 未来大型 Artifact 内容（dirfd Gate 前保持关闭）
 ```
 
 ## 对外提供的能力
@@ -32,7 +33,7 @@ EventStore
 
 `EventStore` 实现 `EventStorePort`，负责追加事件和按 sequence 重放；它不是发布订阅总线。PermissionStateStore 的生命周期事件先追加到 EventStore，再由 InProcessEventBus 推送，确保实时 UI 与断线 replay 看到同一语义。
 
-Phase 1A 的实现落点为 `infrastructure/persistence/sqlite-database.ts`、`sqlite-repository.ts`、`sqlite-permission-event-store.ts` 和 `sqlite-permission-recovery-store.ts`：启动时执行显式 migrations，综合 Session Snapshot 在同一个 SQLite 读事务中读取 Session、Slot、Run、Task、Message、Permission 和最新 sequence。权限状态与审计事件在同一 SQLite 事务内提交，提交后才推送 EventBus。
+Phase 1A 的实现落点为 `infrastructure/persistence/sqlite-database.ts`、`sqlite-repository.ts`、`sqlite-workspace-store.ts`、`sqlite-permission-event-store.ts` 和 `sqlite-permission-recovery-store.ts`：启动时执行显式 migrations；Workspace 的创建/读取/根路径一次性 CAS 由专用 SQLite store 实现；综合 Session Snapshot 在同一个 SQLite 读事务中读取 Session、Slot、Run、Task、Message、Permission 和最新 sequence。权限状态与审计事件在同一 SQLite 事务内提交，提交后才推送 EventBus。
 
 所有 Repository 都通过 Port 暴露，Application 不直接依赖 SQLite 或 JSON 文件 API。
 
@@ -43,7 +44,7 @@ Phase 1A 的实现落点为 `infrastructure/persistence/sqlite-database.ts`、`s
 必须保持原子性的操作：
 
 - Task 状态和 Task Event；
-- Artifact 元数据和 Task 输出关联；
+- Artifact BLOB/metadata 和 metadata-only `artifact.created` Event；
 - Session 创建时的 Session、初始 AgentSlot 与 Runtime attachment；若初始 Slot 使用 RoleBinding，其 Slot、attachment 和私有不可变 Role source snapshot 与 Session 在同一事务内提交。未绑定初始 Slot 不写 Role snapshot；
 - Run 终态和失败原因；
 - start 的 Run、Task、用户 Message、Slot claim、command receipt 和 ContextSource 联合创建；
@@ -87,7 +88,7 @@ Phase 1A 的实现落点为 `infrastructure/persistence/sqlite-database.ts`、`s
 
 - `events(run_id, sequence)` 唯一约束，保证同一 Run 的 sequence 单调且不重复；
 - `permission_requests(status, expires_at)` 索引，支持服务重启后的超时扫描；
-- `tasks(run_id, status)`、`messages(session_id, created_at)` 和 `artifacts(session_id, created_at)` 索引；
+- `tasks(run_id, status)`、`messages(session_id, created_at)` 索引，以及 `artifacts_workspace_session_idx(workspace_id, session_id, created_at, id)`；Artifact metadata page 复用该索引，以 `(created_at DESC, id DESC)` keyset 顺序分页、按列显式读取 metadata 且不读取 `content_blob`，无需新增 migration；
 - 所有 Workspace 归属查询都带 `workspace_id` 条件，避免跨 Workspace 读取；
 - Local Token 默认不建明文列；跨重启持久化时只允许 `token_hash` 和生命周期元数据，原文由 Keychain 管理。
 
@@ -107,7 +108,7 @@ Phase 1A 的实现落点为 `infrastructure/persistence/sqlite-database.ts`、`s
 
 ## 持久化
 
-SQLite 保存运行状态，JSON 保存用户配置，文件系统保存大型 Artifact；EventStore 保存事件用于 replay。
+SQLite 保存运行状态、inline Artifact BLOB 及 EventStore 历史；JSON 保存用户配置；文件系统未来才可保存大型 Artifact（仍受 dirfd Gate 阻断）。
 
 ## 事件
 
@@ -135,9 +136,15 @@ migration v8 为 `messages` 增加 nullable `kind`、`to_slot_id` 和私有 `han
 
 Event 分页为两阶段读取：同一读事务内先查询 `length(CAST(payload_json AS BLOB))` 与边界元数据（每页最多 8 条、单条 512 KiB、每页 4 MiB），全部通过后才读取 payload 并映射；超限 payload 不进入 JS、不 parse。
 
-## Web Phase 2/3 目标迁移（v9，未实现）
+## Workspace 根路径持久化（migration v9）
 
-目标态 schema v9：`workspaces.root_path`（nullable + 部分唯一索引）、Task `node_key/attempt/retry_of_task_id` + `(run_id,node_key,attempt)` 唯一、`task_dependencies`、Run Workflow 快照字段、`agent_slots.context_generation`、`slot_reset_intents`、Artifact 元数据/intent、Mailbox read marker、Workflow template。旧行不猜测：root 保持 NULL；唯一单 Task 可回填 `node_key='legacy'`，其余保持 NULL 并 fail-closed。迁移前备份 SQLite（含 WAL checkpoint），失败回滚；回滚方式为恢复备份。当前 schema 为 v8。
+Migration v9 新增 nullable `workspaces.root_path` 和 `workspaces_root_path_unique_idx` 部分唯一索引；历史 Workspace 保持 NULL，不根据 cwd、数据库位置或其他隐式来源回填。当前 schema 为 v10；canonical 路径的唯一性由 SQLite 约束最终仲裁。专用 `SqliteWorkspaceStore` 负责原子创建 Workspace 与根路径、读取独立 `WorkspaceRootPathDto`，以及通过 `WHERE root_path IS NULL` 的单条 CAS 更新执行旧 Workspace 一次性补设；唯一冲突转成稳定 Repository 结果，其他 SQLite 错误继续抛出。常规 `WorkspaceDto` 形状不变。
+
+migration v10 新增 inline-only `artifacts` 表，保存脱敏 UTF-8 BLOB、`size_bytes`、SHA-256、来源 Run/Task 和 `(session_id, request_id)` 唯一键；创建 Artifact 与 metadata-only `artifact.created` Event 同一事务提交。读取前校验 BLOB 长度和摘要；v9 `workspaces.root_path` 数据保持不变。
+
+## Mailbox 收件状态（migration v11）
+
+migration v11 新增 `mailbox_read_markers(message_id PRIMARY KEY, session_id, recipient_slot_id, read_at)`、按接收方查询的索引，以及 `messages(session_id, to_slot_id, created_at, id) WHERE kind='handoff'` 部分索引；历史 handoff 不回填 marker，缺失即 unread。历史 fixture 缺少 `messages` 表时跳过该迁移的表/索引创建，避免旧测试库升级中断。专用 `SqliteMailboxStore` 只读取摘要列做 keyset 分页（`created_at DESC, id DESC`，`limit+1` 判定 `next_cursor`），详情读取正文，首次 mark-read 在同一事务写 marker 与 metadata-only `message.read` Event；Event 写入失败时整笔回滚，重复标记直接返回既有 `read_at`。文件 intent/staging、Task/Workflow、reset-context 等其他 schema 仍未实现。
 
 ## SQLite 初始化失败资源释放
 

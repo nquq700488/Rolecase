@@ -108,8 +108,8 @@ Bus 和 Store 可以分别替换；事件字段和 schema_version 必须保持�
 
 ## Phase 2 per-Run sequence 与 handoff metadata Event
 
-Event sequence 是 per-Run：新 Run 从 1 连续分配，所有生产 Run-scoped writer（普通 append、权限事件、recovery、finalizeRun）在同一 SQLite 事务内更新 `event_sequence`。`completed_sequence` 只在成功完成事务中冻结，表示 Agent 输出完整性边界；completed 后仅 handoff 专用 writer 可追加 `type='message.created'` 的 metadata Event（sequence = event_sequence+1），不改变 `completed_sequence`，且该 Event 不参与正文拼接。
+Event sequence 是 per-Run：新 Run 从 1 连续分配，所有生产 Run-scoped writer（普通 append、权限事件、recovery、finalizeRun）在同一 SQLite 事务内更新 `event_sequence`。`completed_sequence` 只在成功完成事务中冻结，表示 Agent 输出完整性边界；completed 后 handoff 专用 writer 可追加 `type='message.created'`，Artifact 专用 writer 可追加 `type='artifact.created'`，Mailbox 专用 writer 可追加 `type='message.read'`；三者都只写 metadata、使用 `sequence = event_sequence+1`、不改变 `completed_sequence`，且不参与来源正文拼接。通用 terminal Run Event writer 仍拒绝追加。
 
-## Web Phase 2/3 目标事件（未实现）
+## Web Phase 2/3 事件状态
 
-目标态：Task 相关 Event 携带 `task_id/node_key/attempt`；新增 Artifact `artifact.created`（仅元数据，不含正文）、Mailbox read marker、capacity 拒绝、reset generation/intent 事件；Artifact 事件与 ready 元数据同事务提交，EventBus 仅在提交后发布。
+Task 相关 Event 携带 `task_id/node_key/attempt` 仍为目标态。Artifact `artifact.created` 已纳入当前 inline 切片（payload 仅含 metadata、不含正文），其 Event 与 BLOB/metadata 同事务提交，EventBus 仅在提交后发布。Mailbox `message.read` 已实现：payload 只含 `message_id`、`recipient_slot_id`、`read_at`，与 read marker 同事务提交，EventBus 在提交后 best-effort 发布（失败不回滚，响应标记 `event_bus_status='failed'`）。capacity 拒绝和 reset generation/intent 事件仍未实现。

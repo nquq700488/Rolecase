@@ -10,6 +10,7 @@ import type {
   SessionSnapshotDto,
   TaskDto,
   WorkspaceDto,
+  WorkspaceRootPathDto,
 } from '@rolecast/contract'
 
 import type { PermissionStateStore } from '../permission/permission-state-coordinator.js'
@@ -130,8 +131,17 @@ export type CreateHandoffMessageResult =
 
 /** Phase 1A 的持久化边界。所有方法都按 Workspace/Session 约束查询范围。 */
 export interface RepositoryPort extends PermissionStateStore {
-  /** 保存并返回 Workspace。 */
+  /** 保存并返回未配置根路径的 Workspace，用于迁移与测试场景。 */
   createWorkspace(workspace: WorkspaceDto): Promise<WorkspaceDto>
+  /** 原子保存新 Workspace 与已校验的 canonical 根路径。 */
+  createWorkspaceWithRootPath(workspace: WorkspaceDto, rootPath: string): Promise<'created' | 'duplicate'>
+  /** 获取 Workspace 根路径配置；未知 Workspace 返回 null。 */
+  getWorkspaceRootPath(id: string): Promise<WorkspaceRootPathDto | null>
+  /** 仅将 NULL 根路径一次性设为 canonical 路径，并报告 CAS 结果。 */
+  setWorkspaceRootPathIfUnconfigured(
+    id: string,
+    rootPath: string,
+  ): Promise<'configured' | 'duplicate' | 'already_configured' | 'not_found'>
   /** 列出 Workspace。 */
   listWorkspaces(): Promise<WorkspaceDto[]>
   /** 获取 Workspace。 */

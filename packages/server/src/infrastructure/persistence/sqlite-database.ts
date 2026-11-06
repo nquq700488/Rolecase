@@ -2,7 +2,7 @@ import Database from 'better-sqlite3'
 
 import { encodeJsonRpcRequestId } from './json-rpc-request-id-codec.js'
 
-const CURRENT_SCHEMA_VERSION = 8
+const CURRENT_SCHEMA_VERSION = 12
 
 /**
  * 安全格式化任意 throw 值用于错误 message。
@@ -513,6 +513,242 @@ export class SqliteDatabase {
         throw new Error(`SQLite migration 008 失败: ${error instanceof Error ? error.message : '未知错误'}`)
       }
     }
+
+    const workspaceRootPathVersion = this.connection
+      .prepare('SELECT MAX(version) AS version FROM schema_migrations')
+      .get() as { version?: number | null }
+    if ((workspaceRootPathVersion.version ?? 0) < 9) {
+      const applyWorkspaceRootPathMigration = this.connection.transaction(() => {
+        if (tableExists(this.connection, 'workspaces')) {
+          addColumnIfMissing(this.connection, 'workspaces', 'root_path', 'TEXT')
+          this.connection.exec(`
+            CREATE UNIQUE INDEX IF NOT EXISTS workspaces_root_path_unique_idx
+              ON workspaces(root_path)
+              WHERE root_path IS NOT NULL;
+          `)
+        }
+        this.connection
+          .prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)')
+          .run(9, new Date().toISOString())
+      })
+      try {
+        applyWorkspaceRootPathMigration()
+      } catch (error: unknown) {
+        throw new Error(`SQLite migration 009 失败: ${error instanceof Error ? error.message : '未知错误'}`)
+      }
+    }
+
+    const artifactVersion = this.connection
+      .prepare('SELECT MAX(version) AS version FROM schema_migrations')
+      .get() as { version?: number | null }
+    if ((artifactVersion.version ?? 0) < 10) {
+      const applyArtifactMigration = this.connection.transaction(() => {
+        this.connection.exec(`
+          CREATE TABLE IF NOT EXISTS artifacts (
+            id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+            session_id TEXT NOT NULL REFERENCES sessions(id),
+            task_id TEXT NOT NULL REFERENCES tasks(id),
+            source_run_id TEXT NOT NULL REFERENCES runs(id),
+            request_id TEXT NOT NULL,
+            media_type TEXT NOT NULL CHECK(media_type = 'text/plain; charset=utf-8'),
+            storage_kind TEXT NOT NULL CHECK(storage_kind = 'inline'),
+            status TEXT NOT NULL CHECK(status = 'ready'),
+            size_bytes INTEGER NOT NULL CHECK(size_bytes BETWEEN 0 AND 65536),
+            sha256 TEXT NOT NULL CHECK(length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'),
+            content_blob BLOB NOT NULL CHECK(typeof(content_blob) = 'blob' AND length(content_blob) = size_bytes),
+            created_at TEXT NOT NULL,
+            UNIQUE(session_id, request_id)
+          );
+          CREATE INDEX IF NOT EXISTS artifacts_workspace_session_idx
+            ON artifacts(workspace_id, session_id, created_at, id);
+          CREATE TRIGGER IF NOT EXISTS artifacts_source_guard
+          BEFORE INSERT ON artifacts
+          BEGIN
+            SELECT CASE WHEN NOT EXISTS (
+              SELECT 1
+                FROM workspaces AS w
+                JOIN sessions AS s ON s.workspace_id = w.id
+                JOIN runs AS r ON r.workspace_id = w.id AND r.session_id = s.id
+                JOIN tasks AS t ON t.workspace_id = w.id AND t.session_id = s.id AND t.run_id = r.id
+               WHERE w.id = NEW.workspace_id
+                 AND w.root_path IS NOT NULL
+                 AND s.id = NEW.session_id
+                 AND r.id = NEW.source_run_id
+                 AND r.status = 'completed'
+                 AND t.id = NEW.task_id
+                 AND t.status = 'completed'
+                 AND (SELECT COUNT(*) FROM tasks WHERE run_id = r.id) = 1
+            ) THEN RAISE(ABORT, 'artifact source ownership invalid') END;
+          END;
+        `)
+        this.connection
+          .prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)')
+          .run(10, new Date().toISOString())
+      })
+      try {
+        applyArtifactMigration()
+      } catch (error: unknown) {
+        throw new Error(`SQLite migration 010 失败: ${error instanceof Error ? error.message : '未知错误'}`)
+      }
+    }
+
+    const mailboxVersion = this.connection
+      .prepare('SELECT MAX(version) AS version FROM schema_migrations')
+      .get() as { version?: number | null }
+    if ((mailboxVersion.version ?? 0) < 11) {
+      const applyMailboxMigration = this.connection.transaction(() => {
+        // 部分历史 fixture 缺少 messages；缺表时跳过，避免迁移中断。
+        if (tableExists(this.connection, 'messages')) {
+          this.connection.exec(`
+            CREATE TABLE IF NOT EXISTS mailbox_read_markers (
+              message_id TEXT PRIMARY KEY REFERENCES messages(id),
+              session_id TEXT NOT NULL REFERENCES sessions(id),
+              recipient_slot_id TEXT NOT NULL REFERENCES agent_slots(id),
+              read_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS mailbox_read_markers_recipient_idx
+              ON mailbox_read_markers(session_id, recipient_slot_id);
+            CREATE INDEX IF NOT EXISTS messages_mailbox_idx
+              ON messages(session_id, to_slot_id, created_at, id)
+              WHERE kind = 'handoff';
+          `)
+        }
+        // 历史 handoff 不写 marker，迁移后一律为 unread。
+        this.connection
+          .prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)')
+          .run(11, new Date().toISOString())
+      })
+      try {
+        applyMailboxMigration()
+      } catch (error: unknown) {
+        throw new Error(`SQLite migration 011 失败: ${error instanceof Error ? error.message : '未知错误'}`)
+      }
+    }
+
+    const taskLineageVersion = this.connection
+      .prepare('SELECT MAX(version) AS version FROM schema_migrations')
+      .get() as { version?: number | null }
+    if ((taskLineageVersion.version ?? 0) < 12) {
+      const applyTaskLineageMigration = this.connection.transaction(() => {
+        if (tableExists(this.connection, 'tasks')) {
+          addColumnIfMissing(this.connection, 'tasks', 'node_key', 'TEXT')
+          addColumnIfMissing(this.connection, 'tasks', 'attempt', 'INTEGER')
+          addColumnIfMissing(
+            this.connection,
+            'tasks',
+            'retry_of_task_id',
+            `TEXT CHECK (
+              (node_key IS NULL AND attempt IS NULL AND retry_of_task_id IS NULL)
+              OR (node_key IS NOT NULL AND length(node_key) > 0
+                  AND typeof(attempt) = 'integer' AND attempt > 0)
+            )`,
+          )
+          this.connection.exec(`
+            CREATE UNIQUE INDEX IF NOT EXISTS tasks_run_node_attempt_idx
+              ON tasks(run_id, node_key, attempt)
+              WHERE node_key IS NOT NULL;
+          `)
+          this.connection.exec(`
+            UPDATE tasks
+               SET node_key = 'legacy', attempt = 1
+             WHERE node_key IS NULL AND attempt IS NULL AND retry_of_task_id IS NULL
+               AND (SELECT COUNT(*) FROM tasks AS same_run WHERE same_run.run_id = tasks.run_id) = 1;
+          `)
+          if (columnExists(this.connection, 'runs', 'retry_of_run_id')) {
+            this.connection.exec(`
+              UPDATE tasks
+                 SET retry_of_task_id = (
+                   SELECT parent_task.id
+                     FROM runs AS retry_run
+                     JOIN runs AS parent_run ON parent_run.id = retry_run.retry_of_run_id
+                     JOIN tasks AS parent_task ON parent_task.run_id = parent_run.id
+                    WHERE retry_run.id = tasks.run_id
+                      AND (SELECT COUNT(*) FROM tasks AS retry_tasks WHERE retry_tasks.run_id = retry_run.id) = 1
+                      AND (SELECT COUNT(*) FROM tasks AS parent_tasks WHERE parent_tasks.run_id = parent_run.id) = 1
+                 )
+               WHERE node_key = 'legacy'
+                 AND (SELECT COUNT(*) FROM tasks AS same_run WHERE same_run.run_id = tasks.run_id) = 1
+                 AND EXISTS (
+                   SELECT 1 FROM runs AS retry_run
+                    WHERE retry_run.id = tasks.run_id AND retry_run.retry_of_run_id IS NOT NULL
+                 );
+            `)
+          }
+        }
+        if (tableExists(this.connection, 'events')) {
+          addColumnIfMissing(this.connection, 'events', 'task_id', 'TEXT')
+          addColumnIfMissing(this.connection, 'events', 'node_key', 'TEXT')
+          addColumnIfMissing(
+            this.connection,
+            'events',
+            'attempt',
+            `INTEGER CHECK (
+              (task_id IS NULL AND node_key IS NULL AND attempt IS NULL)
+              OR (task_id IS NOT NULL AND node_key IS NOT NULL AND length(node_key) > 0
+                  AND typeof(attempt) = 'integer' AND attempt > 0)
+            )`,
+          )
+          if (tableExists(this.connection, 'tasks')) {
+            this.connection.exec(`
+              UPDATE events
+                 SET task_id = (
+                       SELECT id FROM tasks AS source_task WHERE source_task.run_id = events.run_id
+                    ),
+                     node_key = 'legacy',
+                     attempt = 1
+               WHERE type = 'agent.message'
+                 AND task_id IS NULL AND node_key IS NULL AND attempt IS NULL
+                 AND (SELECT COUNT(*) FROM tasks AS same_run WHERE same_run.run_id = events.run_id) = 1
+                 AND EXISTS (
+                   SELECT 1 FROM tasks AS source_task
+                    WHERE source_task.run_id = events.run_id
+                      AND source_task.node_key = 'legacy' AND source_task.attempt = 1
+                 );
+            `)
+          }
+        }
+        if (tableExists(this.connection, 'messages')) {
+          addColumnIfMissing(this.connection, 'messages', 'source_task_id', 'TEXT')
+          addColumnIfMissing(
+            this.connection,
+            'messages',
+            'source_task_omitted',
+            `INTEGER CHECK (
+              (source_task_id IS NULL AND source_task_omitted IS NULL)
+              OR (source_task_id IS NOT NULL AND source_task_omitted IS NOT NULL
+                  AND source_task_omitted IN (0, 1))
+            )`,
+          )
+          if (tableExists(this.connection, 'tasks')) {
+            this.connection.exec(`
+              UPDATE messages
+                 SET source_task_id = (
+                       SELECT id FROM tasks AS source_task WHERE source_task.run_id = messages.run_id
+                    ),
+                     source_task_omitted = 1
+               WHERE kind = 'handoff'
+                 AND source_task_id IS NULL AND source_task_omitted IS NULL
+                 AND run_id IS NOT NULL
+                 AND (SELECT COUNT(*) FROM tasks AS same_run WHERE same_run.run_id = messages.run_id) = 1
+                 AND EXISTS (
+                   SELECT 1 FROM tasks AS source_task
+                    WHERE source_task.run_id = messages.run_id
+                      AND source_task.node_key = 'legacy' AND source_task.attempt = 1
+                 );
+            `)
+          }
+        }
+        this.connection
+          .prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)')
+          .run(12, new Date().toISOString())
+      })
+      try {
+        applyTaskLineageMigration()
+      } catch (error: unknown) {
+        throw new Error(`SQLite migration 012 失败: ${error instanceof Error ? error.message : '未知错误'}`)
+      }
+    }
   }
 }
 
@@ -522,6 +758,12 @@ function tableExists(connection: Database.Database, table: string): boolean {
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
     .get(table) as { name?: string } | undefined
   return row?.name === table
+}
+
+/** 判断历史表是否含有指定列，避免迁移引用尚未创建的字段。 */
+function columnExists(connection: Database.Database, table: string, column: string): boolean {
+  const columns = connection.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>
+  return columns.some((entry) => entry.name === column)
 }
 
 /** 仅在列不存在时添加，保证 migration 可重入。 */

@@ -37,11 +37,13 @@ RetryTask
 
 - 用例级命令处理；
 - 输入校验和权限检查；
+- Workspace 创建与旧 Workspace 一次性根路径补设：通过 filesystem validation Port 校验现存目录并 canonicalize，持久化层以唯一约束和 CAS 仲裁；
 - 事务边界编排（单 Agent Run + Task + 用户 Message 必须同一事务）；
 - Role / RoleBinding 配置用例的 Workspace mutation、引用完整性和乐观并发控制；
 - Codex 配置导入 preview/apply 的目标绑定、摘要校验、Credential 引用校验和 ProviderConnection `config_revision` CAS；
 - Credential 创建用例（`CredentialService.create`）：只调用 `CredentialStorePort.save(idempotency_key, secret)` 并返回引用，不调用 `get`、不缓存 Secret；同一幂等键 + 同一 Secret 返回同一引用，同键异值映射 409 `credential_idempotency_conflict`，无效/拒绝/不可用分别映射 422 / 403 / 503；
 - PermissionScheduler 驱动运行中 PermissionRequest 的软/硬超时；
+- ArtifactService：先按 `(session_id, request_id)` 重放或冲突判定，再验证 Workspace root、completed Run 的唯一已完成 Task 和 `completed_sequence` 内完整输出；对脱敏前后内容分别按 65,536 UTF-8 bytes 限制，失败关闭；读取时要求 Store 校验 BLOB 长度与 SHA-256。Session-scoped metadata 列表按已验证 Session 有界分页，不读取正文，也不重新检查 root path；
 - Domain Event 发布；
 - 稳定的应用错误。
 
@@ -55,7 +57,7 @@ Run 的完成、失败与取消统一走 `state_revision` CAS 事务，同时更
 
 ## 依赖
 
-允许依赖：domain、`application/ports`、ClockPort、IdGeneratorPort、CredentialStorePort（引用校验与按幂等键写入）。
+允许依赖：domain、`application/ports`（含 WorkspaceRootPathPort）、ClockPort、IdGeneratorPort、CredentialStorePort（引用校验与按幂等键写入）。
 
 禁止依赖：具体 ACP 包、SQLite Driver、Keychain SDK、WebSocket、Vue。
 
@@ -102,7 +104,7 @@ application/
 
 ## 安全边界
 
-执行文件、Provider 和凭据操作前必须检查 Workspace、Session 和 Local Token 对应的权限上下文。
+根路径配置只验证服务端可访问的现存目录并保存 canonical 路径；Node composition 使用标准库 `realpath`、`stat` 与 `access` 实现 WorkspaceRootPathPort，不创建目录、不读取目录内容、不写文件。执行后续文件、Provider 和凭据操作前必须检查 Workspace、Session 和 Local Token 对应的权限上下文。
 
 ## 替换和升级策略
 
@@ -120,6 +122,6 @@ Application 不提供长时间运行的进程状态机，持续运行交给 Orch
 
 `HandoffService` 只接受 `status=completed` 且 `completed_sequence` 非 NULL 的来源 Run，且该 Run 恰好有一个 Task；来源 Slot 由 Task 推导，目标 Slot 必须同 Session、未软删除且不同于来源。服务按 `1..completed_sequence` 有界分页拼接 `agent.message` 文本，UTF-8 正文上限 64 KiB；`source_history_unavailable` / `source_event_payload_too_large` / `handoff_content_too_large` 分别映射 409/413/413。幂等 lookup 先于来源正文读取与目标 Slot 活动状态校验：同 Session/key/source/target 即使目标 Slot 已软删除也返回原 Message；参数不同 409。handoff Message、私有幂等键与 metadata-only `message.created` Event 在同一事务提交，EventBus 在提交后发布。不创建 Run/Task/claim，不调用 Runtime，不自动 dispatch 或注入 ACP Context。
 
-## Web Phase 2/3 目标能力（未实现）
+## Web Phase 2/3 状态
 
-目标态：Workspace 创建/一次性补设经 filesystem Port 校验 canonical root；HandoffService 支持多 Task 的 `source_task_id`；新增 Artifact 应用服务（脱敏、64 KiB 分流、intent/ready 编排）、Workflow/Coordinator 调度与 Q/P/N admission、Slot reset fence（generation/intent/claim 同事务）。Artifact 文件写入因目录句柄能力未证明保持 BLOCKED；当前 Application 无这些能力。
+Workspace 创建/一次性补设已通过 WorkspaceRootPathPort 校验并持久化 canonical root；SQLite inline Artifact 的来源、脱敏、幂等、字节边界和内容完整性校验已实现。`MailboxService` 已实现 Session+Slot 收件摘要/详情读取与显式 mark-read：列表与详情为纯读，不可用目标统一映射 `mailbox_message_unavailable`（404）；首次标记成功后 best-effort 发布 EventBus，发布失败返回 `event_bus_status='failed'` 而不撤销已持久化状态。Workflow/Coordinator 调度与 Q/P/N admission、Slot reset fence（generation/intent/claim 同事务）仍未实现。Artifact 文件写入因目录句柄能力未证明保持 BLOCKED。

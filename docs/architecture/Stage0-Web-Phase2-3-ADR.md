@@ -1,8 +1,8 @@
 # ADR：Web Phase 2/3 Stage 0 冻结契约
 
-> 状态：**Stage 0 草案，待 Reviewer 接受与用户批准；本文全部为目标态，尚未实现。**
+> 状态：**Stage 0 契约已通过 Reviewer 审查；Workspace 根路径与 SQLite inline Artifact 切片已实现，其余 Phase 2/3 能力仍为目标态。**
 > 计划：`~/.claude/plans/declarative-hugging-cosmos.md`（Web Phase 2/3）。
-> 当前代码基线：Contract/Domain `TaskStatus` 无 `starting`/`blocked`；SQLite schema v8；Workspace DTO 无 `root_path`；无 Artifact/Workflow/Mailbox/reset 实现。
+> 当前代码基线：Contract/Domain `TaskStatus` 无 `starting`/`blocked`；SQLite schema v11；Workspace 根路径通过独立 API 读写且 `WorkspaceDto` 不含该字段；Artifact inline metadata/content API 与持久化已实现；单 Task handoff 的 Mailbox 收件（unread/read）已实现；文件 Artifact/Workflow/多 Task handoff/reset 尚未实现。
 
 ---
 
@@ -89,7 +89,7 @@ TaskStatus = queued | blocked | starting | running | paused
 - `WorkspaceDto` 响应形状保持不变；新增 `WorkspaceRootPathDto { workspace_id, root_path: string | null }` 与查询/补设 API。
 - 所有 Artifact（inline 与文件）要求已配置 root；未配置时零写入、不回落 cwd。
 
-### 3.2 目标 API 与错误（未实现）
+### 3.2 API 与错误（Workspace 根路径已实现；Artifact 错误仍为目标）
 
 ```text
 POST /api/workspaces                         # body 增加 root_path（必填）
@@ -122,28 +122,19 @@ POST /api/workspaces/:workspaceId/root-path  # 仅 root_path IS NULL 时
 
 ---
 
-## 5. Artifact 契约（新模块，目标态）
+## 5. Artifact 契约（当前获批：SQLite inline-only）
 
-能力文档：`docs/modules/artifacts.md`。
+能力文档：`docs/modules/artifacts.md`。本节为当前已批准的服务端切片；本 ADR 的历史文件模式设计不代表文件写入获批或已实现。
 
-- ≤64 KiB（UTF-8）inline 存 SQLite；>64 KiB 写 `<root_path>/.rolecast/artifacts/<session_id>/<artifact_id>`，DB 只存 Workspace 相对 `content_ref`、SHA-256、大小与元数据。
-- 所有 Artifact 先要求有效 `root_path`；路径 containment、symlink/traversal 拒绝；读取先校验哈希，失败统一 `artifact_unavailable`，不返回损坏内容。
-- 大文件固定流程：来源校验与脱敏 → 事务写 `artifact_write_intent`（operation/request ID、artifact ID、受限相对 staging/final 目标；不含原文）→ 同 Workspace 以 no-follow exclusive create 写 staging → fsync 文件 → 原子 rename → fsync 父目录 → 最后一个 SQLite 事务写 `ready` 元数据、Task/Run 引用与事件并删除 intent。
-- 公开 API/Task/Coordinator 只读 `ready`；DB commit 前不可见。
-- **崩溃/恢复表：**
-
-| 崩溃点 | intent | 文件系统 | 重启处理 | 对外可见 |
-| --- | --- | --- | --- | --- |
-| intent 已写，staging 未写 | 有 | 无 | 删除 intent | 否 |
-| staging 写入中/已写，未 rename | 有 | staging | 仅删除 intent 关联 staging，删除 intent | 否 |
-| rename 完成，DB commit 前 | 有 | final | 仅删除该 intent 关联 final，删除 intent | 否 |
-| DB commit 成功 | 已删除 | final | 无需恢复 | 是（ready） |
-| 文件存在但无 intent/元数据 | 无 | unknown | 隔离，不提供读取、不递归删除 | 否 |
-| rename/fsync/commit 任一失败 | 有 | 不确定 | 保持不可见，fail-closed | 否 |
-
-- 同 request ID 重放返回同一 Artifact，不产生第二文件/行。
-- Secret：只接受任务输出、Coordinator 产物或受控用户文本；写入前用现有 `SecretRedactionPort` 脱敏；脱敏缺失/抛错/输出无效时拒绝写入，错误与日志不含正文。不得接受 Credential 字段、Keychain 原文或任意文件上传。
-- 测试使用唯一合成 Secret canary，扫描 SQLite、staging/final 文件、API、事件与日志；替代标记可用。
+- 只接受同 Session 下 `completed` Run 的唯一 `completed` Task；仅提取 `1..completed_sequence` 连续、可信的持久化 `agent.message` 文本。零 Task、单个未完成 Task、多 Task、归属不一致、空输出或历史缺口均拒绝，Artifact/Event 增量为 0。
+- 只接受最多 65,536 UTF-8 bytes；来源原文及脱敏结果均检查字节数。超限返回 413 `artifact_too_large`，不转成文件。
+- 创建前复核已保存 Workspace `root_path`；缺失返回 409 `workspace_root_unconfigured`，失效/不可访问/canonical 值变化返回 409 `workspace_root_unavailable`。检查不读写目录内容；内容读取只访问 SQLite。
+- Contract：`POST /api/sessions/:sessionId/artifacts` 接受 `{ source_run_id, request_id }`；Session-scoped metadata GET 与独立 content GET 分别返回严格 DTO。metadata/Event 不含正文、路径或 Secret；不存在与跨 Session 内容读取统一返回 404 `artifact_unavailable`。
+- SQLite migration v10 增加 inline-only BLOB、大小、SHA-256 和 `(session_id, request_id)` 唯一约束；读取校验实际 byte length、`size_bytes` 与 digest。
+- 脱敏 Port 缺失/抛错/输出无效返回 500 `artifact_sanitization_failed`，不得回退保存原文。Artifact BLOB/metadata 与 metadata-only `artifact.created` 在同一事务提交，提交后发布 EventBus。
+- 幂等键同来源返回原 Artifact；异来源冲突为 409 `artifact_request_conflict`。完成态 Run 的窄授权 writer 只允许 `artifact.created`，不推进冻结的 `completed_sequence`，不放宽通用 terminal Event writer。
+- 稳定错误映射：`invalid_request` 400、`source_history_unavailable` 409、`artifact_too_large` 413、`workspace_root_unconfigured` 409、`workspace_root_unavailable` 409、`artifact_request_conflict` 409、`artifact_unavailable` 404、`artifact_sanitization_failed` 500。
+- 计划早期的 64 KiB inline/文件双路径、`content_ref` 与 intent/staging/rename/recovery 是后续文件模式设计，不属于当前实现范围；没有通过目录句柄能力 Gate 前禁止实现文件写入及 realpath 后绝对路径 fallback。
 
 ---
 
@@ -175,32 +166,26 @@ POST /api/workspaces/:workspaceId/root-path  # 仅 root_path IS NULL 时
 
 ---
 
-## 8. v9 迁移契约（目标态，未实现）
+## 8. SQLite migration 版本状态
 
-当前 schema 版本为 **v8**（handoff Message 字段、Run 游标与完成水位）。本切片计划前向迁移到 **v9**：
+Workspace 根路径 migration v9 已实现；当前 inline Artifact 单独使用 migration v10；Mailbox 收件状态使用 migration v11。早期 Stage 0 草案将 Workspace root、Artifact、Workflow、reset 与 Mailbox 一并列入 v9，已被后续分层迁移取代，不是当前 schema 契约。
 
-| 变更 | 说明 | 旧数据 |
+| 版本 | 变更 | 旧数据 |
 | --- | --- | --- |
-| `workspaces.root_path TEXT NULL` + `WHERE root_path IS NOT NULL` 唯一索引 | Artifact 根目录 | 全部保持 NULL |
-| `tasks.node_key TEXT NULL`、`attempt INTEGER NOT NULL DEFAULT 1`、`retry_of_task_id TEXT NULL` | 节点/attempt | 唯一单 Task Run 可回填 `node_key='legacy'`、attempt=1；多 Task 或无法唯一证明保持 NULL |
-| `task_dependencies(run_id, node_key, depends_on_node_key)` | 依赖边 | 不回填，空表 |
-| `runs.workflow_snapshot_json TEXT NULL`、`template_id TEXT NULL`、`template_version INTEGER NULL` | Workflow 快照 | 旧 Run 保持 NULL |
-| `agent_slots.context_generation INTEGER NOT NULL DEFAULT 1` | reset fence | 旧 Slot 置 1 |
-| `slot_reset_intents(...)` | reset intent | 空表 |
-| `artifacts(...)`、`artifact_write_intents(...)` | Artifact 元数据/恢复 | 空表 |
-| `mailbox_read_markers(message_id, slot_id, read_at)` | Mailbox read | 空表 |
-| `workflow_templates(...)` | 模板 | 空表 |
+| v9（已实现） | `workspaces.root_path TEXT NULL` + 非 NULL 唯一索引 | 既有 Workspace 保持 NULL；当前用户补设值必须保留 |
+| v10（当前 Artifact 切片） | inline-only `artifacts` BLOB/metadata 表及 `(session_id, request_id)` 唯一索引 | Artifact 表为空；v9 `root_path` 与既有数据保持不变 |
+| v11（Mailbox 收件切片） | `mailbox_read_markers`、按接收方索引、handoff 部分索引 | 历史 handoff 不回填 marker，一律 unread；v10 Artifact 与既有数据不变 |
+| 后续版本（未实现） | Task node/attempt、依赖、Workflow snapshot、reset intent/generation、文件 Artifact intents 等 | 另行设计 migration，不提前占用版本或假定回填 |
 
-- 唯一/外键约束在 migration 事务内创建；`node_key`、`root_path` 的部分唯一索引只对非 NULL 生效。
-- 迁移失败整体回滚；迁移前备份 SQLite 文件（含 WAL checkpoint）；回滚方式为恢复备份文件，不做破坏性 downgrade。
-- 旧单 Agent Run/Task/Message/handoff 保持可读；无法唯一映射的旧关系不猜测，相关 resume/dispatch/handoff 返回 `source_history_unavailable` 或 `state_conflict`。
-- 迁移集成测试：v8 fixture → v9，断言旧字段/行不变、新列 NULL/默认值正确、唯一索引生效、失败回滚。
+- 每个前向迁移在 SQLite 事务内建立约束；迁移失败整体回滚。不可逆变更前按项目备份策略保护数据库，不做破坏性 downgrade。
+- 旧单 Agent Run/Task/Message/handoff 保持可读；无法唯一映射的旧关系不猜测，相关操作 fail-closed。
+- migration 测试须以独立旧版数据库 fixture 升级；v10 测试由 v9 fixture 验证，断言既有 `root_path` 和旧表数据不变、Artifact 表/索引约束正确、失败时迁移回滚。
 
 ---
 
 ## 9. 未决与用户决策
 
-1. **Q/P/N 数值**：0B 最小测量能力已获用户批准（尚未实现），生产 admission 保持 fail-closed；0B 在参考机产出曲线后由用户决定资源目标并书面批准，未批准前不冻结数字。
+1. **Q/P/N 数值**：0B 最小测量能力已实现，0C 本机合成容量曲线与报告已完成（见 `容量基线.md` 及同目录 CSV）；当前等待用户审阅、决定资源目标并书面批准有限 Q/P/N。测量结果不构成额度批准，生产 admission 继续 fail-closed；未获书面批准前不冻结数字。
 2. **文件系统实现依赖**：Node 22 核心无 dirfd-relative API；受维护 native 依赖（如 `@openclaw/fs-safe`）的 macOS 语义未验证，且本轮禁止安装依赖。**文件模式** Artifact 写入保持 fail-closed；SQLite inline 不受该门阻断（仍需有效 `root_path`）。需用户决定是否批准后续引入并验证依赖。
-3. **Schema v9 的字段命名/索引**：本 ADR 为冻结候选，Reviewer 接受后生效。
+3. 早期把 Workspace root 与其他 Phase 2 schema 合并至 v9 的草案已过期；当前事实为 Workspace root migration v9 已实现、inline Artifact 独立使用 v10。
 4. 桌面端、视觉重做、真实 Provider/live 测试、通用 Workspace CRUD 不在范围。

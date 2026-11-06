@@ -237,6 +237,16 @@ Provider 页在配置表单下方列出当前 Workspace 的 Session：保留 API
 
 SessionPage 在已完成 Run 上提供目标 Slot 选择与「交接」按钮；成功后切换到接收 Slot 并刷新 snapshot。`kind='handoff'` 的 Message 只在 `to_slot_id` 匹配的 Slot 视图显示来源→目标与「填入草稿」；填入草稿只写 textarea，不调用发送或 Runtime。
 
-## Web Phase 2/3 目标入口（未实现）
+## Session Room 只读 TaskBoard
 
-目标态：Workspace 新建要求本地服务端目录文本输入（无文件选择器），旧 Workspace 显示未配置与一次性补设；TaskBoard、Inbox（unread/read）、Artifact 列表与预览、Workflow/Coordinator 控制、reset 确认与 generation 提示。保留现有视觉语言，不做整体重做；Artifact 文件写入未开放时显示不可用原因。
+Session Room 直接投影已加载的 `SessionSnapshotDto.tasks`，保留快照顺序并逐条显示标题、现有 Task 状态、owner Slot、所属 Run ID、明确标为 Run attempt 的次数和更新时间。缺失的 Slot 或 Run 显示不可用提示；加载中、已加载空列表与无可用快照使用不同文案。列表只读，不新增 API、Store、Contract、写操作或 Runtime dispatch。
+
+当前 Task DTO 不包含 Task 自身 attempt、依赖边或阻断原因，状态也不含 `starting` / `blocked`；本切片不推测或伪造这些字段。完整多 Task Workflow 仍需按后续契约支持 Task attempt、`starting` / `blocked`、依赖满足后的恢复，以及永久阻断原因。
+
+## Workspace 根路径设置
+
+新建 Workspace 表单要求名称和服务端可访问的现存目录绝对路径；旧 Workspace 的根路径状态分为读取中、已配置、未设置和读取失败。已配置时展示服务端 canonical path；补设仅对明确处于未设置状态的 Workspace 显示，提交前展示不可逆说明并要求用户确认。读取失败仅提供重试，不显示补设入口；竞争失败后重新读取服务端状态。路径不写入 localStorage，页面不创建目录、不读取目录内容，也不提供文件选择器。
+
+## Web Phase 2/3 目标入口（部分实现）
+
+Workspace 根路径新建与一次性补设、只读 Session snapshot TaskBoard、Mailbox 收件箱，以及 Session-scoped Artifact metadata 列表与纯文本预览已落地。`MailboxPanel` 按 `发送给` 选中的 Slot 加载摘要，显示“已加载未读 N 条”；`next_cursor` 非空时同时提示还有更多消息，不把部分计数当作全量未读数。打开条目先读详情再显式 mark-read，成功后更新该条状态；失败保留 unread 并可重试，EventBus 通知失败提示已保存可刷新；切换 Session/Slot 清空旧摘要并丢弃迟到响应；同一 Slot 内连续打开不同消息时，只有最近一次的详情响应与 mark-read 结果可以更新当前详情，关闭详情会使未完成请求失效。ArtifactPanel 放在 TaskBoard 后、Mailbox 前，按 Session 读取仅含 metadata 的有界页，不按 Agent Slot 过滤；显式打开时才读取独立 content endpoint，正文以文本节点放在 `<pre>` 中，不解析 HTML/Markdown。切换 Session 会清空并使旧请求失效，关闭预览在触发按钮仍连接 DOM 时恢复焦点。完整多 Task TaskBoard 仍待实现；Artifact 搜索、更新、删除、文件操作与全文预览不提供。其余目标：Workflow/Coordinator 控制、reset 确认与 generation 提示。保留现有视觉语言，不做整体重做；Artifact 文件写入未开放时显示不可用原因，dirfd Gate 前不得实现。

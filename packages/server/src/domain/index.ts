@@ -29,6 +29,7 @@ export type SessionStatus = 'active' | 'paused' | 'completed' | 'archived'
 export interface Workspace {
   readonly id: string
   readonly name: string
+  readonly rootPath: string | null
   readonly createdAt: Date
   readonly updatedAt: Date
 }
@@ -149,6 +150,27 @@ export interface Task {
   readonly updatedAt: Date
 }
 
+/** Artifact 的公开元数据领域视图。 */
+export interface ArtifactMetadata {
+  readonly id: string
+  readonly workspaceId: string
+  readonly sessionId: string
+  readonly taskId: string
+  readonly sourceRunId: string
+  readonly mediaType: 'text/plain; charset=utf-8'
+  readonly storageKind: 'inline'
+  readonly status: 'ready'
+  readonly sizeBytes: number
+  readonly sha256: string
+  readonly createdAt: Date
+}
+
+/** Artifact 私有 inline 正文记录，不得进入 metadata DTO 或事件。 */
+export interface ArtifactPrivateContent {
+  readonly artifactId: string
+  readonly bytes: Uint8Array
+}
+
 /** 用户、Agent 或系统消息。 */
 export interface Message {
   readonly id: string
@@ -170,8 +192,38 @@ export class DomainStateConflictError extends Error {
   }
 }
 
+/** inline Artifact 在 Domain 内的 UTF-8 字节上限。 */
+export const MAX_INLINE_ARTIFACT_SIZE_BYTES = 65_536
+
+/**
+ * @name createInlineArtifactContent
+ * @description 校验 inline 正文上限并复制字节，避免持有调用方的可变缓冲区
+ * @param {object} input Artifact ID 与脱敏后的正文 bytes
+ * @return {ArtifactPrivateContent} 独立持有的私有正文记录
+ */
+export function createInlineArtifactContent(input: {
+  readonly artifactId: string
+  readonly bytes: Uint8Array
+}): ArtifactPrivateContent {
+  if (input.artifactId.trim().length === 0) {
+    throw new DomainStateConflictError('Artifact ID 不能为空')
+  }
+  if (input.bytes.byteLength > MAX_INLINE_ARTIFACT_SIZE_BYTES) {
+    throw new DomainStateConflictError('Artifact inline 内容超过 65,536 字节')
+  }
+  return {
+    artifactId: input.artifactId,
+    bytes: new Uint8Array(input.bytes),
+  }
+}
+
 /** 创建 Workspace。 */
-export function createWorkspace(input: { id: string; name: string; now: Date }): Workspace {
+export function createWorkspace(input: {
+  readonly id: string
+  readonly name: string
+  readonly rootPath: string | null
+  readonly now: Date
+}): Workspace {
   const name = input.name.trim()
   if (name.length === 0) {
     throw new DomainStateConflictError('Workspace 名称不能为空')
@@ -179,6 +231,7 @@ export function createWorkspace(input: { id: string; name: string; now: Date }):
   return {
     id: input.id,
     name,
+    rootPath: input.rootPath,
     createdAt: new Date(input.now),
     updatedAt: new Date(input.now),
   }

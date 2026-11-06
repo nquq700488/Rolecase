@@ -108,6 +108,17 @@ describe('SqliteRunClosureStore', () => {
     await repository.close()
   })
 
+  it('普通 Run 创建时持久化可信的 agent/1 Task lineage', async () => {
+    const repository = await setup()
+    const first = run('run-lineage')
+    await repository.createTurnWithClaim(first, task('task-lineage', first.id), message('msg-lineage', first.id), timestamp)
+
+    const database = (repository as unknown as { database: SqliteDatabase }).database
+    expect(database.prepare('SELECT node_key, attempt, retry_of_task_id FROM tasks WHERE id = ?')
+      .get('task-lineage')).toEqual({ node_key: 'agent', attempt: 1, retry_of_task_id: null })
+    await repository.close()
+  })
+
   it('Run CAS 只在 revision 匹配时成功，并拒绝覆盖终态', async () => {
     const repository = await setup()
     const first = run('run-001')
@@ -259,6 +270,35 @@ describe('SqliteRunClosureStore', () => {
     const duplicate = run('run-005', { status: 'failed', attempt: 4 })
     await expect(createRetryTurn(repository, child.id, duplicate, task('task-005', duplicate.id), 'retry-duplicate'))
       .resolves.toBeNull()
+    await repository.close()
+  })
+
+  it('Run retry 继承父 Task node_key 并记录父 Task 身份', async () => {
+    const repository = await setup()
+    const parent = run('run-parent', { status: 'failed' })
+    await repository.createTurnWithClaim(parent, task('task-parent', parent.id), message('message-parent', parent.id), timestamp)
+    const child = run('run-child', { status: 'running', attempt: 2 })
+    await createRetryTurn(repository, parent.id, child, task('task-child', child.id), 'retry-lineage')
+
+    const database = (repository as unknown as { database: SqliteDatabase }).database
+    expect(database.prepare('SELECT node_key, attempt, retry_of_task_id FROM tasks WHERE id = ?')
+      .get('task-child')).toEqual({ node_key: 'agent', attempt: 1, retry_of_task_id: 'task-parent' })
+    await repository.close()
+  })
+
+  it('Run retry 对 unknown 父 lineage fail-closed', async () => {
+    const repository = await setup()
+    const parent = run('run-parent', { status: 'failed' })
+    await repository.createTurnWithClaim(parent, task('task-parent', parent.id), message('message-parent', parent.id), timestamp)
+    const database = (repository as unknown as { database: SqliteDatabase }).database
+    database.prepare('UPDATE tasks SET node_key = NULL, attempt = NULL, retry_of_task_id = NULL WHERE id = ?')
+      .run('task-parent')
+
+    const child = run('run-child', { status: 'running', attempt: 2 })
+    await expect(createRetryTurn(repository, parent.id, child, task('task-child', child.id), 'retry-unknown-lineage'))
+      .resolves.toBeNull()
+    await expect(repository.getRun(child.id)).resolves.toBeNull()
+    await expect(database.prepare('SELECT id FROM tasks WHERE id = ?').get('task-child')).toBeUndefined()
     await repository.close()
   })
 

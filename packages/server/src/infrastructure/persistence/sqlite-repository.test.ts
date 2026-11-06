@@ -116,6 +116,68 @@ describe('SQLite Repository', () => {
     await repository.close()
   })
 
+  it('createTurn 创建的 Task 持久化默认 agent/1 lineage', async () => {
+    const database = new SqliteDatabase(':memory:')
+    const repository = new SqliteRepository(database)
+    await repository.createWorkspace(workspace('workspace-turn'))
+    await repository.createSession(session('session-turn', 'workspace-turn'))
+    await repository.createAgentSlot(slot('slot-turn', 'session-turn'))
+    const turnRun = run('run-turn', 'workspace-turn', 'session-turn')
+
+    await repository.createTurn(
+      turnRun,
+      { ...task('task-turn', 'workspace-turn', 'session-turn', turnRun.id), slot_id: 'slot-turn' },
+      message('message-turn', 'session-turn'),
+    )
+
+    expect(database.prepare('SELECT node_key, attempt, retry_of_task_id FROM tasks WHERE id = ?')
+      .get('task-turn')).toEqual({ node_key: 'agent', attempt: 1, retry_of_task_id: null })
+    await repository.close()
+  })
+
+  it('saveTask 新建 Task 写入默认 lineage 且更新时保留已有 lineage', async () => {
+    const database = new SqliteDatabase(':memory:')
+    const repository = new SqliteRepository(database)
+    await repository.createWorkspace(workspace('workspace-save'))
+    await repository.createSession(session('session-save', 'workspace-save'))
+    await repository.createAgentSlot(slot('slot-save', 'session-save'))
+    const taskRun = run('run-save', 'workspace-save', 'session-save')
+    await repository.saveRun(taskRun)
+    const savedTask = { ...task('task-save', 'workspace-save', 'session-save', taskRun.id), slot_id: 'slot-save' }
+
+    await repository.saveTask(savedTask)
+    expect(database.prepare('SELECT node_key, attempt, retry_of_task_id FROM tasks WHERE id = ?')
+      .get(savedTask.id)).toEqual({ node_key: 'agent', attempt: 1, retry_of_task_id: null })
+
+    database.prepare("UPDATE tasks SET node_key = 'preserved', attempt = 3 WHERE id = ?").run(savedTask.id)
+    await repository.saveTask({ ...savedTask, status: 'completed' })
+    expect(database.prepare('SELECT node_key, attempt, retry_of_task_id FROM tasks WHERE id = ?')
+      .get(savedTask.id)).toEqual({ node_key: 'preserved', attempt: 3, retry_of_task_id: null })
+    await repository.close()
+  })
+
+  it('同一 Run 已有 Task 时 saveTask 不写默认 lineage，多 Task Run 可正常写入', async () => {
+    const database = new SqliteDatabase(':memory:')
+    const repository = new SqliteRepository(database)
+    await repository.createWorkspace(workspace('workspace-multi'))
+    await repository.createSession(session('session-multi', 'workspace-multi'))
+    await repository.createAgentSlot(slot('slot-multi', 'session-multi'))
+    const multiRun = run('run-multi', 'workspace-multi', 'session-multi')
+    await repository.saveRun(multiRun)
+
+    await repository.saveTask({
+      ...task('task-first', 'workspace-multi', 'session-multi', multiRun.id), slot_id: 'slot-multi',
+    })
+    // 公共 TaskDto 无法表达节点身份；第二个 Task 写 NULL lineage 表示未知，不能套用单 Agent 默认值。
+    await repository.saveTask({
+      ...task('task-second', 'workspace-multi', 'session-multi', multiRun.id), slot_id: 'slot-multi',
+    })
+
+    expect(database.prepare('SELECT node_key, attempt, retry_of_task_id FROM tasks WHERE id = ?')
+      .get('task-second')).toEqual({ node_key: null, attempt: null, retry_of_task_id: null })
+    await repository.close()
+  })
+
   it('软删除 Slot 时保留历史行与 Runtime cleanup attachment', async () => {
     const database = new SqliteDatabase(':memory:')
     const repository = new SqliteRepository(database)
@@ -714,5 +776,62 @@ describe('SQLite Repository', () => {
       .run(JSON.stringify({ api_key: 'not-test-secret' }), connection.id)
     await expect(repository.getProviderConnection(connection.id)).rejects.toThrow('SQLite Codex 配置字段无效')
     await repository.close()
+  })
+
+  it('原子创建 Workspace 与根路径，重复 canonical 路径不留下记录', async () => {
+    const repository = new SqliteRepository(new SqliteDatabase(':memory:'))
+    try {
+      await expect(repository.createWorkspaceWithRootPath(workspace('root-1'), '/canonical/root'))
+        .resolves.toBe('created')
+      await expect(repository.getWorkspaceRootPath('root-1')).resolves.toEqual({
+        workspace_id: 'root-1',
+        root_path: '/canonical/root',
+      })
+      await expect(repository.createWorkspaceWithRootPath(workspace('root-2'), '/canonical/root'))
+        .resolves.toBe('duplicate')
+      await expect(repository.getWorkspace('root-2')).resolves.toBeNull()
+      await expect(repository.listWorkspaces()).resolves.toHaveLength(1)
+    } finally {
+      await repository.close()
+    }
+  })
+
+  it('只对 NULL 根路径执行一次性设置且保留原值', async () => {
+    const repository = new SqliteRepository(new SqliteDatabase(':memory:'))
+    try {
+      await repository.createWorkspace(workspace('legacy-root'))
+      await expect(repository.getWorkspaceRootPath('legacy-root')).resolves.toEqual({
+        workspace_id: 'legacy-root',
+        root_path: null,
+      })
+      await expect(repository.setWorkspaceRootPathIfUnconfigured('legacy-root', '/canonical/root'))
+        .resolves.toBe('configured')
+      await expect(repository.setWorkspaceRootPathIfUnconfigured('legacy-root', '/replacement/root'))
+        .resolves.toBe('already_configured')
+      await expect(repository.setWorkspaceRootPathIfUnconfigured('missing-root', '/canonical/other'))
+        .resolves.toBe('not_found')
+      await expect(repository.getWorkspaceRootPath('legacy-root')).resolves.toEqual({
+        workspace_id: 'legacy-root',
+        root_path: '/canonical/root',
+      })
+    } finally {
+      await repository.close()
+    }
+  })
+
+  it('一次性补设遇到其他 Workspace 已使用的 canonical 路径时不写入', async () => {
+    const repository = new SqliteRepository(new SqliteDatabase(':memory:'))
+    try {
+      await repository.createWorkspaceWithRootPath(workspace('configured-root'), '/canonical/root')
+      await repository.createWorkspace(workspace('legacy-root'))
+      await expect(repository.setWorkspaceRootPathIfUnconfigured('legacy-root', '/canonical/root'))
+        .resolves.toBe('duplicate')
+      await expect(repository.getWorkspaceRootPath('legacy-root')).resolves.toEqual({
+        workspace_id: 'legacy-root',
+        root_path: null,
+      })
+    } finally {
+      await repository.close()
+    }
   })
 })

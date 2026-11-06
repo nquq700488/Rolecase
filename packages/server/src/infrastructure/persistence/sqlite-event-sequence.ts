@@ -96,3 +96,47 @@ export function appendHandoffMetadataEventSync(
   }
   return appendRunScopedEventSync(database, event, { allowTerminal: true })
 }
+
+/** Artifact 专用的 completed-Run metadata Event writer；不改变完成水位。 */
+export function appendArtifactMetadataEventSync(
+  database: SqliteDatabase,
+  event: Omit<EventEnvelope, 'sequence'>,
+): EventEnvelope {
+  if (event.type !== 'artifact.created') {
+    throw new Error('artifact metadata event must be artifact.created')
+  }
+  const run = readRunSequenceRow(database, event.run_id)
+  if (
+    run === null
+    || run.status !== 'completed'
+    || !Number.isSafeInteger(run.event_sequence)
+    || !Number.isSafeInteger(run.completed_sequence)
+    || (run.event_sequence ?? -1) < (run.completed_sequence ?? 0)
+    || (run.completed_sequence ?? 0) <= 0
+  ) {
+    throw new Error('artifact source run has no trusted sequence')
+  }
+  return appendRunScopedEventSync(database, event, { allowTerminal: true })
+}
+
+/** Mailbox 专用的 completed-Run metadata Event writer；不改变完成水位。 */
+export function appendMailboxReadMetadataEventSync(
+  database: SqliteDatabase,
+  event: Omit<EventEnvelope, 'sequence'>,
+): EventEnvelope {
+  if (event.type !== 'message.read') {
+    throw new Error('mailbox metadata event must be message.read')
+  }
+  const run = readRunSequenceRow(database, event.run_id)
+  if (
+    run === null
+    || run.status !== 'completed'
+    || !Number.isSafeInteger(run.event_sequence)
+    || !Number.isSafeInteger(run.completed_sequence)
+    || (run.event_sequence ?? -1) < (run.completed_sequence ?? 0)
+    || (run.completed_sequence ?? 0) <= 0
+  ) {
+    throw new Error('mailbox source run has no trusted sequence')
+  }
+  return appendRunScopedEventSync(database, event, { allowTerminal: true })
+}

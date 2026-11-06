@@ -64,7 +64,7 @@ describe('SQLite migrations', () => {
     }
     expect(providerColumns.some((column) => column.name === 'codex_config_json')).toBe(true)
     expect(providerColumns.some((column) => column.name === 'config_revision')).toBe(true)
-    expect(version.version).toBe(8)
+    expect(version.version).toBe(12)
     database.close()
     await rm(directory, { recursive: true, force: true })
   })
@@ -140,7 +140,7 @@ describe('SQLite migrations', () => {
 
     const database = new SqliteDatabase(filename)
     const version = database.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number }
-    expect(version.version).toBe(8)
+    expect(version.version).toBe(12)
     const receiptColumns = database.prepare('PRAGMA table_info(command_receipts)').all() as Array<{ name: string }>
     expect(receiptColumns.some((column) => column.name === 'target_slot_id')).toBe(true)
     for (const table of ['agent_slot_role_snapshots', 'context_sources']) {
@@ -168,7 +168,7 @@ describe('SQLite migrations', () => {
     const columns = database.prepare('PRAGMA table_info(agent_slots)').all() as Array<{ name: string }>
     const slot = database.prepare("SELECT id, deleted_at FROM agent_slots WHERE id = 'slot-001'").get() as
       { id: string; deleted_at: string | null }
-    expect(version.version).toBe(8)
+    expect(version.version).toBe(12)
     expect(columns.some((column) => column.name === 'deleted_at')).toBe(true)
     expect(slot).toEqual({ id: 'slot-001', deleted_at: null })
     database.close()
@@ -217,7 +217,7 @@ describe('SQLite migrations', () => {
 
     const database = new SqliteDatabase(filename)
     const version = database.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number }
-    expect(version.version).toBe(8)
+    expect(version.version).toBe(12)
 
     for (const table of [
       'runtime_attachments', 'command_receipts', 'slot_activity_claims',
@@ -248,7 +248,7 @@ describe('SQLite migrations', () => {
   it('v8 只新增 nullable handoff 字段与 Run 游标，不回填旧记录', () => {
     const database = new SqliteDatabase(':memory:')
     const version = database.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number }
-    expect(version.version).toBe(8)
+    expect(version.version).toBe(12)
 
     const messageColumns = database.prepare('PRAGMA table_info(messages)').all() as Array<{ name: string }>
     for (const column of ['kind', 'to_slot_id', 'handoff_request_id']) {
@@ -548,6 +548,121 @@ describe('SQLite migrations', () => {
         originalClose.call(openedConnection)
       }
       await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('v9 迁移为历史 Workspace 保留 NULL 根路径', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'rolecast-workspace-root-migration-'))
+    const filename = join(directory, 'legacy.sqlite')
+    const legacy = new Database(filename)
+    legacy.exec(`
+      CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+      INSERT INTO schema_migrations(version, applied_at) VALUES (8, '2026-11-04T10:00:00.000Z');
+      CREATE TABLE workspaces (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO workspaces(id, name, created_at, updated_at)
+        VALUES ('old-1', '旧工作区 1', 't', 't'), ('old-2', '旧工作区 2', 't', 't');
+    `)
+    legacy.close()
+
+    const database = new SqliteDatabase(filename)
+    try {
+      const version = database.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number }
+      const workspaces = database.prepare('SELECT id, root_path FROM workspaces ORDER BY id').all()
+      expect(version.version).toBe(12)
+      expect(workspaces).toEqual([
+        { id: 'old-1', root_path: null },
+        { id: 'old-2', root_path: null },
+      ])
+    } finally {
+      database.close()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('v9 升级到当前版本并保留已配置的 Workspace 根路径', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'rolecast-artifact-migration-'))
+    const filename = join(directory, 'legacy-v9.sqlite')
+    const legacy = new Database(filename)
+    legacy.exec(`
+      CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+      INSERT INTO schema_migrations(version, applied_at) VALUES (9, '2026-11-04T10:00:00.000Z');
+      CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, root_path TEXT);
+      CREATE TABLE sessions (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE runs (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, status TEXT NOT NULL, attempt INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, event_sequence INTEGER, completed_sequence INTEGER);
+      CREATE TABLE tasks (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, run_id TEXT NOT NULL, slot_id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE events (event_id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, run_id TEXT NOT NULL, sequence INTEGER NOT NULL, type TEXT NOT NULL, source TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_json TEXT NOT NULL, UNIQUE(run_id, sequence));
+      INSERT INTO workspaces(id, name, created_at, updated_at, root_path) VALUES ('workspace-1', 'w', 't', 't', '/workspace/root');
+    `)
+    legacy.close()
+
+    const database = new SqliteDatabase(filename)
+    try {
+      const version = database.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number }
+      const rootPath = database.prepare('SELECT root_path FROM workspaces WHERE id = ?').get('workspace-1') as { root_path: string }
+      const artifactTable = database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'").get()
+      expect(version.version).toBe(12)
+      expect(rootPath.root_path).toBe('/workspace/root')
+      expect(artifactTable).toBeDefined()
+    } finally {
+      database.close()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('v10 升级到当前版本时为历史 handoff 保留 unread 且不写 marker', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'rolecast-mailbox-migration-'))
+    const filename = join(directory, 'legacy-v10.sqlite')
+    const legacy = new Database(filename)
+    legacy.exec(`
+      CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+      INSERT INTO schema_migrations(version, applied_at) VALUES (10, '2026-11-05T10:00:00.000Z');
+      CREATE TABLE workspaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, root_path TEXT);
+      CREATE TABLE sessions (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, name TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE agent_slots (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role_binding_id TEXT, model_id TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, deleted_at TEXT);
+      CREATE TABLE runs (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, status TEXT NOT NULL, attempt INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, event_sequence INTEGER, completed_sequence INTEGER);
+      CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, run_id TEXT, sender_kind TEXT NOT NULL, sender_id TEXT, content TEXT NOT NULL, created_at TEXT NOT NULL, kind TEXT, to_slot_id TEXT, handoff_request_id TEXT);
+      CREATE TABLE events (event_id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, run_id TEXT NOT NULL, sequence INTEGER NOT NULL, type TEXT NOT NULL, source TEXT NOT NULL, occurred_at TEXT NOT NULL, payload_json TEXT NOT NULL, UNIQUE(run_id, sequence));
+      INSERT INTO workspaces(id, name, created_at, updated_at) VALUES ('workspace-1', 'w', 't', 't');
+      INSERT INTO sessions(id, workspace_id, name, status, created_at, updated_at) VALUES ('session-1', 'workspace-1', 's', 'active', 't', 't');
+      INSERT INTO agent_slots(id, session_id, model_id, status, created_at) VALUES ('slot-1', 'session-1', 'model-1', 'idle', 't');
+      INSERT INTO runs(id, workspace_id, session_id, status, attempt, created_at, updated_at, event_sequence, completed_sequence) VALUES ('run-1', 'workspace-1', 'session-1', 'completed', 1, 't', 't', 1, 1);
+      INSERT INTO messages(id, session_id, run_id, sender_kind, sender_id, content, created_at, kind, to_slot_id) VALUES ('message-1', 'session-1', 'run-1', 'agent', 'slot-sender', 'legacy body', '2026-11-05T09:00:00.000Z', 'handoff', 'slot-1');
+    `)
+    legacy.close()
+
+    const database = new SqliteDatabase(filename)
+    try {
+      const version = database.prepare('SELECT MAX(version) AS version FROM schema_migrations').get() as { version: number }
+      const markers = database.prepare('SELECT COUNT(*) AS count FROM mailbox_read_markers').get() as { count: number }
+      const message = database.prepare('SELECT content FROM messages WHERE id = ?').get('message-1') as { content: string }
+      expect(version.version).toBe(12)
+      expect(markers.count).toBe(0)
+      expect(message.content).toBe('legacy body')
+    } finally {
+      database.close()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
+  it('v9 允许多个未配置 Workspace 但拒绝重复 canonical 根路径', () => {
+    const database = new SqliteDatabase(':memory:')
+    try {
+      const insert = database.prepare(
+        'INSERT INTO workspaces(id, name, created_at, updated_at, root_path) VALUES (?, ?, ?, ?, ?)',
+      )
+      expect(() => {
+        insert.run('null-1', '未配置 1', 't', 't', null)
+        insert.run('null-2', '未配置 2', 't', 't', null)
+        insert.run('root-1', '根目录 1', 't', 't', '/canonical/root')
+        insert.run('root-2', '根目录 2', 't', 't', '/canonical/root')
+      }).toThrow()
+    } finally {
+      database.close()
     }
   })
 })

@@ -139,6 +139,6 @@ ACP 的 `authenticate` API key metadata、gateway headers 与 Adapter-owned OAut
 
 `SecretRedactionScope` 单独测试：直接脱敏、跨 2/3 个 chunk 的 Secret、不同流互不干扰、`flushStream` 按路径返回安全尾部且不跨字段拼接、`dropStream` 丢弃、`close` 幂等且 fail-closed、空 Secret fail-closed、敏感字段按字段名脱敏。
 
-## Web Phase 2/3 Secret 边界（目标态）
+## Web Phase 2/3 Secret 边界
 
-Artifact 内容只从已脱敏的任务输出/Coordinator 产物/受控用户文本构建，写入前再次调用 `SecretRedactionPort`；拒绝 Credential 字段、Keychain 原文与任意文件上传。脱敏失败即拒绝写入，错误/日志不含正文；合成 canary 扫描覆盖 SQLite、文件、API、事件与日志。当前 Artifact 尚未实现。
+当前 SQLite inline Artifact 只从同 Session 的 completed Run 唯一 completed Task 的已脱敏持久化输出构建，写入前再次调用 `SecretRedactionPort`；拒绝 Credential 字段、Keychain 原文与任意文件上传。脱敏失败即拒绝写入，错误/日志不含正文；合成 canary 扫描覆盖 SQLite、API、事件与日志。Coordinator/受控用户文本来源和文件 Artifact 仍是未来能力；文件写入继续受目录句柄能力 Gate 阻断.

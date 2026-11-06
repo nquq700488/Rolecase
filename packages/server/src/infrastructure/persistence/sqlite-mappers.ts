@@ -9,6 +9,7 @@ import type {
   SessionDto,
   TaskDto,
   WorkspaceDto,
+  WorkspaceRootPathDto,
 } from '@rolecast/contract'
 
 type Row = Record<string, unknown>
@@ -38,6 +39,16 @@ export const toWorkspace = (row: Row): WorkspaceDto => ({
   updated_at: String(row.updated_at),
 })
 
+/**
+ * @name toWorkspaceRootPath
+ * @description 将 Workspace 根路径列转换为独立配置 DTO
+ * @param {Row} row SQLite Workspace 行
+ * @return {WorkspaceRootPathDto} Workspace 根路径状态
+ */
+export const toWorkspaceRootPath = (row: Row): WorkspaceRootPathDto => ({
+  workspace_id: String(row.id),
+  root_path: toNullableString(row.root_path),
+})
 
 export const toSession = (row: Row): SessionDto => ({
   id: String(row.id),
