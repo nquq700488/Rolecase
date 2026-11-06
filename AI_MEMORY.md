@@ -37,7 +37,7 @@
 - **[约束]** 回执 `completed/accepted` 只能在证明 `session/prompt` 已写出（Runtime dispatch 信号或已收到事件）后写入；dispatch 前失败必须回 `failed/not_started`，崩溃窗口内保持 `running/started` 并交给启动恢复判 `ambiguous`。
 - **[约束]** cancel 超时（`interrupted`）不代表旧 turn 已停止：旧 turn 活动期间必须保留 Slot claim，禁止同 Run resume/同 session 新 dispatch；旧 turn 结束后才释放 claim，释放后 resume/re-dispatch 仍须确认 claim 归本 Run，且不得改判 `cancelled`。
 - ACP `session/resume` 使用 `{ sessionId, cwd, mcpServers }`，两个锁定 Adapter 均已验证
-- `pnpm install --frozen-lockfile --prefer-offline` 可复现；pnpm 仍提示 esbuild build script 被忽略，但当前类型检查和测试通过
+- **[事实]** `pnpm install --frozen-lockfile --prefer-offline` 可复现；pnpm 安装时提示 esbuild build script 被忽略。
 
 ## 架构地图（先看这一节再改代码）
 
@@ -122,6 +122,7 @@
 - **[约束]** 当前跨平台凭据路线只维护 macOS Keychain；Linux Secret Service/libsecret 不纳入项目范围，Windows Credential Manager 延后处理。
 - **[约束]** 认证只支持两条路径：继承本地 CLI 状态（inherited），或使用 API key（isolated `credential_ref`）。Rolecast 不实现 OAuth、device-code、交互终端登录、`ProviderAuthPort`、认证回调或认证状态持久化。
 - **[平台]** Node `child_process` 的 stdout 数据可能晚于 `exit` 事件到达；解析子进程输出要等 stdout `close`，否则会读到空字符串造成偶发误判。
+- **[约束]** PreToolUse 的 `file-max-lines` 对超限的非测试文件写入会实际阻断，即使规则标记为 `severity: warn`。
 
 ## 观察中模式（持续学习信号收集）
 
