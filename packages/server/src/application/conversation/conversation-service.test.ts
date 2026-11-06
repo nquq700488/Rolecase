@@ -26,6 +26,7 @@ class TestIds {
 
 class PermissionRuntime implements AgentRuntimePort {
   sendTurns = 0
+  forgedTaskId: string | null = null
   readonly responses: Array<{ requestId: string | number; optionId?: string; cancelled?: boolean }> = []
   readonly permissionReady: Promise<void>
   failRespondPermission = false
@@ -90,7 +91,10 @@ class PermissionRuntime implements AgentRuntimePort {
     yield {
       session_id: 'acp-session-001',
       kind: 'agent_message_chunk',
-      payload: { content: { type: 'text', text: '已完成' } },
+      payload: {
+        content: { type: 'text', text: '已完成' },
+        ...(this.forgedTaskId === null ? {} : { task_id: this.forgedTaskId }),
+      },
     }
     yield { session_id: 'acp-session-001', kind: 'turn_completed', payload: {} }
   }
@@ -114,12 +118,14 @@ class PermissionRuntime implements AgentRuntimePort {
 }
 
 async function setup(): Promise<{
+  database: SqliteDatabase
   repository: SqliteRepository
   runtime: PermissionRuntime
   scheduler: PermissionScheduler
   conversation: ConversationService
 }> {
-  const repository = new SqliteRepository(new SqliteDatabase(':memory:'))
+  const database = new SqliteDatabase(':memory:')
+  const repository = new SqliteRepository(database)
   await repository.createWorkspace({
     id: 'workspace-001', name: '测试',
     created_at: '2026-10-14T10:00:00.000Z', updated_at: '2026-10-14T10:00:00.000Z',
@@ -145,7 +151,7 @@ async function setup(): Promise<{
     scheduler,
     new SecretRedactor(),
   )
-  return { repository, runtime, scheduler, conversation }
+  return { database, repository, runtime, scheduler, conversation }
 }
 
 describe('ConversationService 权限主链路', () => {
@@ -253,6 +259,89 @@ describe('ConversationService 权限主链路', () => {
     expect(typeof runtime.responses[0]?.requestId).toBe('number')
     scheduler.stop()
     await repository.close()
+  })
+
+  it('Adapter 伪造 task_id 时仍以可信 Task 写入私有 provenance 且不改变序列水位', async () => {
+    const { database, repository, runtime, scheduler, conversation } = await setup()
+    try {
+      await repository.createTurn(
+        {
+          id: 'run-foreign', workspace_id: 'workspace-001', session_id: 'session-001',
+          status: 'completed', attempt: 1,
+          created_at: '2026-10-14T10:00:00.000Z', updated_at: '2026-10-14T10:00:00.000Z',
+        },
+        {
+          id: 'task-foreign', workspace_id: 'workspace-001', session_id: 'session-001',
+          run_id: 'run-foreign', slot_id: 'slot-001', title: '已有任务', status: 'completed',
+          created_at: '2026-10-14T10:00:00.000Z', updated_at: '2026-10-14T10:00:00.000Z',
+        },
+        {
+          id: 'message-foreign', session_id: 'session-001', run_id: 'run-foreign',
+          sender_kind: 'user', sender_id: null, content: '合成任务', created_at: '2026-10-14T10:00:00.000Z',
+        },
+      )
+      runtime.forgedTaskId = 'task-foreign'
+      const turn = await conversation.sendMessage('session-001', { content: '执行任务' })
+      await runtime.permissionReady
+      const permission = (await repository.getSessionSnapshot('session-001'))?.permissions[0]
+      if (permission === undefined) {
+        throw new Error('权限请求未持久化')
+      }
+      await conversation.answerPermission(permission.id, 'allow_once')
+      await conversation.waitForTurn(turn.run.id)
+
+      const sequences = database.prepare(
+        'SELECT sequence FROM events WHERE run_id = ? ORDER BY sequence',
+      ).all(turn.run.id) as Array<{ sequence: number }>
+      expect(sequences.map(({ sequence }) => sequence)).toEqual(
+        sequences.map((_, index) => index + 1),
+      )
+      const runSequence = database.prepare(
+        'SELECT event_sequence, completed_sequence FROM runs WHERE id = ?',
+      ).get(turn.run.id) as { event_sequence: number; completed_sequence: number }
+      expect(runSequence.event_sequence).toBe(sequences.length)
+      expect(runSequence.completed_sequence).toBe(runSequence.event_sequence)
+
+      const provenance = database.prepare(`
+        SELECT run_id, task_id, node_key, attempt FROM events
+        WHERE type = 'agent.message'
+      `).all()
+      expect(provenance).toEqual([{
+        run_id: turn.run.id, task_id: turn.task.id, node_key: 'agent', attempt: 1,
+      }])
+    } finally {
+      scheduler.stop()
+      await repository.close()
+    }
+  })
+
+  it('Event 写入时拒绝已不属于 Runtime Run 的 Task', async () => {
+    const { database, repository, runtime, scheduler, conversation } = await setup()
+    try {
+      await repository.saveRun({
+        id: 'run-other', workspace_id: 'workspace-001', session_id: 'session-001',
+        status: 'queued', attempt: 1,
+        created_at: '2026-10-14T10:00:00.000Z', updated_at: '2026-10-14T10:00:00.000Z',
+      })
+      const turn = await conversation.sendMessage('session-001', { content: '执行任务' })
+      await runtime.permissionReady
+      database.prepare('UPDATE tasks SET run_id = ? WHERE id = ?').run('run-other', turn.task.id)
+
+      const permission = (await repository.getSessionSnapshot('session-001'))?.permissions[0]
+      if (permission === undefined) {
+        throw new Error('权限请求未持久化')
+      }
+      await conversation.answerPermission(permission.id, 'allow_once')
+      await conversation.waitForTurn(turn.run.id)
+
+      expect(database.prepare(`
+        SELECT run_id, event_id FROM events WHERE type = 'agent.message'
+      `).all()).toEqual([])
+      await expect(repository.getRun(turn.run.id)).resolves.toMatchObject({ status: 'failed' })
+    } finally {
+      scheduler.stop()
+      await repository.close()
+    }
   })
 
   it('旧的 NULL Slot receipt 只映射到 Session 原始 Slot', async () => {

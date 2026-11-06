@@ -44,6 +44,25 @@ const appendText = async (repository: SqliteRepository, id: string, text: string
   })
 }
 
+const completeRun = async (
+  repository: SqliteRepository,
+  run: RunDto,
+  task: TaskDto,
+): Promise<void> => {
+  const revision = await repository.getRunStateRevision(run.id)
+  const result = await repository.finalizeRun({
+    run: { ...run, status: 'completed', ended_at: timestamp, updated_at: timestamp },
+    expectedStateRevision: revision ?? 1,
+    taskId: task.id,
+    taskStatus: 'completed',
+    slotId: task.slot_id,
+    releaseClaim: false,
+  })
+  if (result === null) {
+    throw new Error('Run 完成状态未能持久化')
+  }
+}
+
 describe('handoff event 页的两阶段读取', () => {
   it('超过 512 KiB 时只查长度元数据，不执行 payload SELECT 或 JSON parse', async () => {
     const { database, repository, store } = await setup()
@@ -87,6 +106,96 @@ describe('handoff event 页的两阶段读取', () => {
     expect(payloadIndex).toBeGreaterThan(metadataIndex)
     database.prepare = originalPrepare
     await repository.close()
+  })
+})
+
+describe('handoff Event provenance fail-closed', () => {
+  it('接受与 Task 行一致的 agent.message provenance', async () => {
+    const { database, repository, run, task, store } = await setup()
+    try {
+      await appendText(repository, 'e-agent', 'answer')
+      database.prepare(`
+        UPDATE events SET task_id = ?, node_key = 'agent', attempt = 1 WHERE event_id = ?
+      `).run(task.id, 'e-agent')
+      await completeRun(repository, run, task)
+
+      const page = await store.readRunEventPage(run.id, 0, 8)
+      expect(page).toMatchObject({
+        kind: 'ok', events: [{ type: 'agent.message', payload: { text: 'answer' } }], nextSequence: 1,
+      })
+    } finally {
+      await repository.close()
+    }
+  })
+
+  it('完成水位内缺少 provenance 的 agent.message 返回 inconsistent', async () => {
+    const { database, repository, run, task, store } = await setup()
+    try {
+      await appendText(repository, 'e-agent', 'unknown owner')
+      await completeRun(repository, run, task)
+      expect(database.prepare('SELECT completed_sequence FROM runs WHERE id = ?').get(run.id))
+        .toEqual({ completed_sequence: 1 })
+
+      await expect(store.readRunEventPage(run.id, 0, 8)).resolves.toMatchObject({ kind: 'inconsistent' })
+    } finally {
+      await repository.close()
+    }
+  })
+
+  it('provenance 与 Task lineage 不一致时返回 inconsistent', async () => {
+    const { database, repository, run, task, store } = await setup()
+    try {
+      await appendText(repository, 'e-agent', 'contradictory owner')
+      database.prepare(`
+        UPDATE events SET task_id = ?, node_key = 'agent', attempt = 1 WHERE event_id = ?
+      `).run(task.id, 'e-agent')
+      database.prepare("UPDATE tasks SET node_key = 'other-node' WHERE id = ?").run(task.id)
+      await completeRun(repository, run, task)
+
+      await expect(store.readRunEventPage(run.id, 0, 8)).resolves.toMatchObject({ kind: 'inconsistent' })
+    } finally {
+      await repository.close()
+    }
+  })
+
+  it('provenance 指向其他 Run 的 Task 时返回 inconsistent', async () => {
+    const { database, repository, run, task, store } = await setup()
+    try {
+      const foreignRun: RunDto = { ...run, id: 'run-foreign' }
+      const foreignTask: TaskDto = {
+        ...task, id: 'task-foreign', run_id: foreignRun.id, slot_id: 'slot-2',
+      }
+      await repository.createTurn(foreignRun, foreignTask, {
+        id: 'message-foreign', session_id: 's', run_id: foreignRun.id,
+        sender_kind: 'user', sender_id: null, content: 'foreign prompt', created_at: timestamp,
+      })
+      await appendText(repository, 'e-agent', 'foreign owner')
+      database.prepare(`
+        UPDATE events SET task_id = ?, node_key = 'agent', attempt = 1 WHERE event_id = ?
+      `).run(foreignTask.id, 'e-agent')
+      await completeRun(repository, run, task)
+
+      await expect(store.readRunEventPage(run.id, 0, 8)).resolves.toMatchObject({ kind: 'inconsistent' })
+    } finally {
+      await repository.close()
+    }
+  })
+
+  it('无 provenance 的非 agent.message 元数据事件仍可读取', async () => {
+    const { repository, run, task, store } = await setup()
+    try {
+      await repository.appendEvent({
+        event_id: 'e-metadata', schema_version: 1, workspace_id: 'w', session_id: 's', run_id: run.id,
+        type: 'message.created', source: 'handoff', occurred_at: timestamp, payload: { message_id: 'm-1' },
+      })
+      await completeRun(repository, run, task)
+
+      await expect(store.readRunEventPage(run.id, 0, 8)).resolves.toMatchObject({
+        kind: 'ok', events: [{ type: 'message.created' }], nextSequence: 1,
+      })
+    } finally {
+      await repository.close()
+    }
   })
 })
 
