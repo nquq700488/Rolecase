@@ -2,11 +2,13 @@
 import { computed, getCurrentInstance, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
-import type { AgentSlotDto, RoleBindingDto, RoleDto } from '@rolecast/contract'
+import type { AgentSlotDto, RoleBindingDto, RoleDto, TaskDto } from '@rolecast/contract'
 
 import { bindingEndpoints, roleEndpoints } from '@/api/endpoints.js'
 import type { MessageDto } from '@rolecast/contract'
 
+import ArtifactPanel from '@/components/artifact/ArtifactPanel.vue'
+import MailboxPanel from '@/components/mailbox/MailboxPanel.vue'
 import PermissionCard from '@/components/PermissionCard.vue'
 import { useSessionStore } from '@/stores/session.js'
 
@@ -46,6 +48,25 @@ watch(() => slots.value.map((slot) => slot.id).join(','), () => {
 const messages = computed(() => sessionStore.snapshot?.messages ?? [])
 const runs = computed(() => sessionStore.snapshot?.runs ?? [])
 const tasks = computed(() => sessionStore.snapshot?.tasks ?? [])
+const taskRows = computed(() => tasks.value.map((task) => {
+  const ownerSlot = slots.value.find((slot) => slot.id === task.slot_id)
+  return {
+    task,
+    ownerLabel: ownerSlot === undefined
+      ? `Agent Slot 不可用（${task.slot_id}）`
+      : agentSlotLabel(ownerSlot),
+    run: runs.value.find((candidate) => candidate.id === task.run_id),
+  }
+}))
+const taskStatusLabels: Record<TaskDto['status'], string> = {
+  queued: '排队中',
+  running: '运行中',
+  paused: '已暂停',
+  completed: '已完成',
+  failed: '失败',
+  cancelled: '已取消',
+  interrupted: '已中断',
+}
 const handoffTargets = ref<Record<string, string>>({})
 // handoff 只投影到匹配的接收 Slot；普通消息不受 Slot 过滤。
 const visibleMessages = computed(() => messages.value.filter(
@@ -437,6 +458,34 @@ function formatTime(value: string): string {
           </div>
         </div>
       </div>
+      <section data-testid="task-board" aria-labelledby="task-board-heading">
+        <h3 id="task-board-heading">Tasks</h3>
+        <p v-if="sessionStore.snapshot === null && sessionStore.loading" class="muted" role="status">正在载入任务快照…</p>
+        <p v-else-if="sessionStore.snapshot === null" class="muted" role="status">任务快照暂不可用。</p>
+        <p v-else-if="tasks.length === 0" class="muted" role="status">当前 Session 没有任务。</p>
+        <ul v-else class="task-list">
+          <li
+            v-for="row in taskRows"
+            :key="row.task.id"
+            class="task-item"
+            :data-testid="`task-row-${row.task.id}`"
+            :data-task-id="row.task.id"
+          >
+            <strong class="task-status">{{ taskStatusLabels[row.task.status] }}</strong>
+            <h4 class="task-item-title">{{ row.task.title }}</h4>
+            <p class="task-item-meta">负责 Agent：{{ row.ownerLabel }}</p>
+            <p v-if="row.run" class="task-item-meta">
+              所属 Run：{{ row.task.run_id }} · Run attempt {{ row.run.attempt }}
+            </p>
+            <p v-else class="task-item-meta">所属 Run 不可用（{{ row.task.run_id }}）</p>
+            <p class="task-item-meta">
+              更新时间：<time :datetime="row.task.updated_at">{{ formatTime(row.task.updated_at) }}</time>
+            </p>
+          </li>
+        </ul>
+      </section>
+      <ArtifactPanel :session-id="sessionId" />
+      <MailboxPanel :session-id="sessionId" :slot-id="selectedSlotId" />
     </aside>
   </main>
 </template>

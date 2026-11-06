@@ -1,6 +1,9 @@
 import {
   addAgentSlotRequestSchema,
   agentSlotDtoSchema,
+  artifactContentDtoSchema,
+  artifactPageDtoSchema,
+  artifactPageQuerySchema,
   capabilitySnapshotSchema,
   codexConfigImportApplyRequestSchema,
   codexConfigImportPreviewRequestSchema,
@@ -12,6 +15,11 @@ import {
   createSessionRequestSchema,
   createWorkspaceRequestSchema,
   handoffRequestSchema,
+  mailboxMarkReadDtoSchema,
+  mailboxMarkReadRequestSchema,
+  mailboxMessageDetailDtoSchema,
+  mailboxPageDtoSchema,
+  mailboxPageQuerySchema,
   messageDtoSchema,
   credentialReferenceDtoSchema,
   modelCatalogEntryDtoSchema,
@@ -27,6 +35,8 @@ import {
   updateRoleRequestSchema,
   sessionSnapshotDtoSchema,
   workspaceDtoSchema,
+  workspaceRootPathDtoSchema,
+  setWorkspaceRootPathRequestSchema,
   type CodexConfigImportApplyRequest,
   type CodexConfigImportPreviewRequest,
   type CreateCredentialRequest,
@@ -35,10 +45,14 @@ import {
   type CreateRoleRequest,
   type CreateSessionRequest,
   type AddAgentSlotRequest,
+  type ArtifactPageQuery,
   type CreateWorkspaceRequest,
   type HandoffRequest,
+  type MailboxMarkReadRequest,
+  type MailboxPageQuery,
   type RunCommandRequest,
   type SendMessageRequest,
+  type SetWorkspaceRootPathRequest,
   type UpdateProviderConnectionRequest,
   type UpdateRoleBindingRequest,
   type UpdateRoleRequest,
@@ -63,6 +77,24 @@ export const workspaceEndpoints = {
   create: (input: CreateWorkspaceRequest) => {
     const payload = createWorkspaceRequestSchema.parse(input)
     return apiRequest({ method: 'POST', url: '/api/workspaces', data: payload }, workspaceDtoSchema)
+  },
+  getRootPath: (workspaceId: string) => apiRequest(
+    {
+      method: 'GET',
+      url: `/api/workspaces/${encodeURIComponent(workspaceId)}/root-path`,
+    },
+    workspaceRootPathDtoSchema,
+  ),
+  setRootPath: (workspaceId: string, input: SetWorkspaceRootPathRequest) => {
+    const payload = setWorkspaceRootPathRequestSchema.parse(input)
+    return apiRequest(
+      {
+        method: 'POST',
+        url: `/api/workspaces/${encodeURIComponent(workspaceId)}/root-path`,
+        data: payload,
+      },
+      workspaceRootPathDtoSchema,
+    )
   },
 }
 
@@ -244,6 +276,62 @@ export const sessionEndpoints = {
     return apiRequest(
       { method: 'POST', url: `/api/sessions/${encodeURIComponent(sessionId)}/handoffs`, data: payload },
       messageDtoSchema,
+    )
+  },
+}
+
+/** Artifact metadata 分页与按需正文 API。 */
+export const artifactEndpoints = {
+  list: (sessionId: string, query: ArtifactPageQuery) => {
+    const parsed = artifactPageQuerySchema.parse(query)
+    const search = new URLSearchParams({ limit: String(parsed.limit) })
+    if (parsed.cursor !== undefined) {
+      search.set('cursor', parsed.cursor)
+    }
+    return apiRequest(
+      { method: 'GET', url: `/api/sessions/${encodeURIComponent(sessionId)}/artifacts?${search.toString()}` },
+      artifactPageDtoSchema,
+    )
+  },
+  content: (sessionId: string, artifactId: string) => apiRequest(
+    {
+      method: 'GET',
+      url: `/api/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactId)}/content`,
+    },
+    artifactContentDtoSchema,
+  ),
+}
+
+/** Mailbox 收件 API。 */
+export const mailboxEndpoints = {
+  list: (sessionId: string, query: MailboxPageQuery) => {
+    const parsed = mailboxPageQuerySchema.parse(query)
+    const search = new URLSearchParams({ slot_id: parsed.slot_id, limit: String(parsed.limit) })
+    if (parsed.cursor !== undefined) {
+      search.set('cursor', parsed.cursor)
+    }
+    return apiRequest(
+      { method: 'GET', url: `/api/sessions/${encodeURIComponent(sessionId)}/mailbox?${search.toString()}` },
+      mailboxPageDtoSchema,
+    )
+  },
+  detail: (sessionId: string, messageId: string, slotId: string) => apiRequest(
+    {
+      method: 'GET',
+      url: `/api/sessions/${encodeURIComponent(sessionId)}/mailbox/${encodeURIComponent(messageId)}`
+        + `?slot_id=${encodeURIComponent(slotId)}`,
+    },
+    mailboxMessageDetailDtoSchema,
+  ),
+  markRead: (sessionId: string, messageId: string, input: MailboxMarkReadRequest) => {
+    const payload = mailboxMarkReadRequestSchema.parse(input)
+    return apiRequest(
+      {
+        method: 'POST',
+        url: `/api/sessions/${encodeURIComponent(sessionId)}/mailbox/${encodeURIComponent(messageId)}/read`,
+        data: payload,
+      },
+      mailboxMarkReadDtoSchema,
     )
   },
 }
